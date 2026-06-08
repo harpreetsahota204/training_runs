@@ -1,0 +1,36 @@
+{
+  "name": "@voxel51/training-runs",
+  "version": "0.1.0",
+  "description": "Training-run lineage panel for FiftyOne",
+  "type": "module",
+  "main": "src/index.tsx",
+  "fiftyone": {
+    "script": "dist/index.umd.js"
+  },
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@fiftyone/components": "*",
+    "@fiftyone/operators": "*",
+    "@fiftyone/plugins": "*",
+    "@fiftyone/state": "*",
+    "@mui/material": "*",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "recoil": "^0.7.7",
+    "styled-components": "^6.0.0"
+  },
+  "devDependencies": {
+    "@rollup/plugin-node-resolve": "^15.0.0",
+    "@types/node": "^22.7.6",
+    "@types/react": "^18.2.0",
+    "@vitejs/plugin-react": "^4.3.2",
+    "@voxel51/fiftyone-js-plugin-build": "^2.0.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.9",
+    "vite-plugin-externalize-deps": "^0.8.0"
+  },
+  "packageManager": "yarn@4.5.0"
+}

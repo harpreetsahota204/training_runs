@@ -1,0 +1,18 @@
+name: "@voxel51/training-runs"
+version: 0.1.0
+description: >
+  Record training-run lineage in FiftyOne: associate a view (stages + frozen
+  sample IDs), a checkpoint URI, a tracker link, and an evaluation. Association,
+  not execution.
+fiftyone:
+  version: ">=1.0"
+# Operators + the Training Runs panel are registered in __init__.py:register().
+# The panel renders via the React component "TrainingRunsView" (composite_view),
+# built from src/ to dist/index.umd.js. Panel data + actions are panel methods,
+# so no standalone data/action operators are needed.
+operators:
+  - log_training_run
+  - edit_training_run
+  - open_training_runs_panel
+panels:
+  - training_runs
