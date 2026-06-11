@@ -1,20 +1,13 @@
 """
 Operators: the App-facing forms. These ASSOCIATE; they never run training, and
-they never run eval (the eval is selected from existing runs). All heavy lifting
-delegates to lineage.py.
+they never run eval (the eval is selected from existing runs). All persistence
+goes through the training-run framework (``dataset.add_training_run`` etc.).
 """
 
+import fiftyone.core.evaluation as foev
 import fiftyone.core.labels as fol
 import fiftyone.operators as foo
 import fiftyone.operators.types as types
-
-from .lineage import (
-    STORE_NAME,
-    add_training_run,
-    get_training_run,
-    list_training_runs,
-    update_training_run,
-)
 
 _NONE = "__none__"
 _CURRENT = "__current__"
@@ -101,15 +94,33 @@ def _project_input(inputs, default=None):
     )
 
 
-def _resolve_samples(ctx, target):
-    """Maps a dropdown choice to (samples, saved_view_name)."""
+def _resolve_view_arg(ctx, target):
+    """Maps a dropdown choice to a ``train_view`` arg for the engine.
+
+    A saved-view choice is passed through as its **name** (a string) so the
+    engine captures the saved-view-name breadcrumb; the synthetic targets
+    resolve to view objects; "(none)" -> ``None``.
+    """
     if target in (None, _NONE):
-        return None, None
+        return None
     if target == _CURRENT:
-        return ctx.view, None
+        return ctx.view
     if target == _DATASET:
-        return ctx.dataset, None
-    return ctx.dataset.load_saved_view(target), target
+        return ctx.dataset
+    return target  # a saved-view name; the engine resolves + records it
+
+
+def _clear_eval_link(run):
+    """Unlinks the run's current evaluation, clearing both ends of the weld."""
+    samples = run.samples
+    eval_key = run.config.eval_key
+    if eval_key and eval_key in samples.list_evaluations():
+        info = samples.get_evaluation_info(eval_key)
+        if getattr(info.config, "train_key", None) == run.train_key:
+            info.config.train_key = None
+            foev.EvaluationMethod.update_run_config(samples, eval_key, info.config)
+    run.config.eval_key = None
+    run.save_config()
 
 
 def _split_target_input(inputs, ctx, name, label, description):
@@ -169,27 +180,43 @@ class LogTrainingRun(foo.Operator):
         return types.Property(inputs)
 
     def execute(self, ctx):
-        samples, train_svn = _resolve_samples(ctx, ctx.params["view_target"])
-        val_samples, val_svn = _resolve_samples(ctx, ctx.params.get("val_target"))
-        test_samples, test_svn = _resolve_samples(ctx, ctx.params.get("test_target"))
-        record = add_training_run(
-            samples,
-            ctx.params["train_key"],
-            val_view=val_samples,
-            test_view=test_samples,
-            checkpoint_uri=ctx.params.get("checkpoint_uri") or None,
-            project_url=ctx.params.get("project_url") or None,
-            eval_key=ctx.params.get("eval_key") or None,
-            label_field=ctx.params.get("label_field") or None,
-            saved_view_name=train_svn,
-            val_saved_view_name=val_svn,
-            test_saved_view_name=test_svn,
-            store=ctx.store(STORE_NAME),
-        )
+        train_key = ctx.params["train_key"]
+        # RD1: the engine requires a valid identifier; reject early with a
+        # readable message instead of a raw ValueError from register_run.
+        if not train_key.isidentifier():
+            ctx.ops.notify(
+                f"'{train_key}' is not a valid name: use letters, digits and "
+                "underscores, and don't start with a digit.",
+                variant="error",
+            )
+            return
+
+        train_view = _resolve_view_arg(ctx, ctx.params["view_target"])
+        val_view = _resolve_view_arg(ctx, ctx.params.get("val_target"))
+        test_view = _resolve_view_arg(ctx, ctx.params.get("test_target"))
+        try:
+            # The Log door ASSOCIATES: auto_eval=False (never runs an eval);
+            # an existing eval is linked via eval_key. gt/pred are stored as
+            # metadata only, so pred_field is not collected here.
+            ctx.dataset.add_training_run(
+                train_key,
+                train_view,
+                val_view=val_view,
+                test_view=test_view,
+                gt_field=ctx.params.get("label_field") or None,
+                auto_eval=False,
+                checkpoint_uri=ctx.params.get("checkpoint_uri") or None,
+                project_url=ctx.params.get("project_url") or None,
+                eval_key=ctx.params.get("eval_key") or None,
+            )
+        except ValueError as e:
+            ctx.ops.notify(str(e), variant="error")
+            return
+
         ctx.ops.notify(
-            f"Logged training run '{record['train_key']}'", variant="success"
+            f"Logged training run '{train_key}'", variant="success"
         )
-        return {"train_key": record["train_key"]}
+        return {"train_key": train_key}
 
 
 class EditTrainingRun(foo.Operator):
@@ -204,7 +231,7 @@ class EditTrainingRun(foo.Operator):
     def resolve_input(self, ctx):
         inputs = types.Object()
 
-        keys = list_training_runs(ctx.dataset, store=ctx.store(STORE_NAME))
+        keys = ctx.dataset.list_training_runs()
         if not keys:
             inputs.view("warning", types.Warning(label="No training runs to edit"))
             return types.Property(inputs)
@@ -215,27 +242,38 @@ class EditTrainingRun(foo.Operator):
         inputs.enum("train_key", keys, required=True, view=key_view, label="Training run")
 
         train_key = ctx.params.get("train_key")
-        if not train_key:
+        if not train_key or not ctx.dataset.has_training_run(train_key):
             return types.Property(inputs)  # dynamic: fields appear after selection
 
-        record = get_training_run(ctx.dataset, train_key, store=ctx.store(STORE_NAME)) or {}
-        _label_input(inputs, ctx, record.get("label_field"))
-        _checkpoint_input(inputs, record.get("checkpoint_uri"))
-        _project_input(inputs, record.get("project_url"))
-        _eval_input(inputs, ctx, record.get("eval_key"))
+        c = ctx.dataset.get_training_info(train_key).config
+        _label_input(inputs, ctx, c.gt_field)
+        _checkpoint_input(inputs, c.checkpoint_uri)
+        _project_input(inputs, c.project_url)
+        _eval_input(inputs, ctx, c.eval_key)
         return types.Property(inputs)
 
     def execute(self, ctx):
         train_key = ctx.params["train_key"]
-        update_training_run(
-            ctx.dataset,
-            train_key,
-            store=ctx.store(STORE_NAME),
-            checkpoint_uri=ctx.params.get("checkpoint_uri") or None,
-            project_url=ctx.params.get("project_url") or None,
-            eval_key=ctx.params.get("eval_key") or None,
-            label_field=ctx.params.get("label_field") or None,
-        )
+        run = ctx.dataset.load_training_run(train_key)
+
+        # Scalar metadata edits write straight to the config (not the
+        # TrainingResults.checkpoint_uri setter, which is locked post-finish).
+        run.config.gt_field = ctx.params.get("label_field") or None
+        run.config.checkpoint_uri = ctx.params.get("checkpoint_uri") or None
+        run.config.project_url = ctx.params.get("project_url") or None
+        run.save_config()
+
+        # Eval association goes through the weld (1:1, refuse on collision).
+        new_eval = ctx.params.get("eval_key") or None
+        try:
+            if new_eval is not None:
+                run.link_evaluation(new_eval)  # idempotent if unchanged
+            elif run.config.eval_key is not None:
+                _clear_eval_link(run)
+        except ValueError as e:
+            ctx.ops.notify(str(e), variant="error")
+            return {"train_key": train_key}
+
         ctx.ops.notify(f"Updated training run '{train_key}'", variant="success")
         return {"train_key": train_key}
 

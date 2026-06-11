@@ -10,20 +10,66 @@ forms succeed, ``on_success`` re-pushes the rows so the panel refreshes itself.
 
 import fiftyone.operators as foo
 import fiftyone.operators.types as types
-
-from .lineage import (
-    STORE_NAME,
-    RUN_PREFIX,
-    SPLIT_KEYS,
-    delete_training_run,
-    get_training_run,
-    load_split_view,
-    split_present,
-    update_training_run,
-)
+import fiftyone.utils.training as fout
 
 _PLUGIN = "@voxel51/training-runs"
 _EVAL_PANEL = "model_evaluation_panel_builtin"
+
+# The three splits, in display order.
+SPLITS = ("train", "val", "test")
+
+
+def _split_info(config, split):
+    """The per-split ``SplitInfo`` the React panel consumes.
+
+    Presence keys off ``*_view_ids`` (the fact -- a frozen split is present
+    iff it has an ID snapshot), NOT the saved-view name (often ``None`` for
+    tag/ad-hoc views). The label is the saved-view name if one was passed,
+    else "ad-hoc view" when stages exist, else ``None``.
+    """
+    ids = getattr(config, f"{split}_view_ids", None)
+    name = getattr(config, f"{split}_view_name", None)
+    stages = getattr(config, f"{split}_view_stages", None)
+    return {
+        "present": ids is not None,
+        "label": name or ("ad-hoc view" if stages else None),
+        "num_samples": len(ids or []),
+    }
+
+
+def _run_row(key, info):
+    """Adapts a :class:`TrainingInfo` into the ``Row`` shape the React panel
+    consumes. The single seam between the run framework and the panel: every
+    other handler maps 1:1 to an SDK call.
+
+    Args:
+        key: the ``train_key``
+        info: the :class:`fiftyone.core.training.TrainingInfo`
+
+    Returns:
+        a JSON-safe ``Row`` dict
+    """
+    c = info.config
+    timestamp = getattr(info, "timestamp", None)
+    return {
+        "train_key": key,
+        "checkpoint_uri": c.checkpoint_uri,
+        "project_url": c.project_url,
+        "eval_key": c.eval_key,
+        # the panel's "Label field" is the run's ground-truth field
+        "label_field": c.gt_field,
+        # Row types created_at as string|null -> serialize in the adapter
+        "created_at": timestamp.isoformat() if timestamp else None,
+        # review pill, NOT execution status (config.status)
+        "status": c.review_status or "new",
+        # execution lifecycle: declared/running/completed/failed (+ the
+        # scheduled/queued states the delegated path will add later)
+        "exec_status": c.status or "declared",
+        # opaque per-run training params / script (rendered read-only)
+        "train_config": c.train_config or None,
+        "note": c.note or "",
+        "splits": {s: _split_info(c, s) for s in SPLITS},
+    }
 
 
 def _eval_id(dataset, eval_key):
@@ -41,7 +87,13 @@ STATUSES = {
     "promoted": "Promoted",
     "archived": "Archived",
 }
-_DEFAULT_STATUS = "new"
+
+
+def _get_info(dataset, train_key):
+    """The :class:`TrainingInfo` for a key, or ``None`` if absent."""
+    if not train_key or not dataset.has_training_run(train_key):
+        return None
+    return dataset.get_training_info(train_key)
 
 
 def _num(v):
@@ -53,37 +105,14 @@ def _num(v):
         return v
 
 
-def _split_summary(record, split):
-    """Compact per-split descriptor for the panel: presence, label, count."""
-    stages_key, ids_key, name_key = SPLIT_KEYS[split]
-    label = record.get(name_key) or ("ad-hoc view" if record.get(stages_key) else None)
-    return {
-        "present": split_present(record, split),
-        "label": label,
-        "num_samples": len(record.get(ids_key) or []),
-    }
-
-
 def _runs_rows(ctx):
-    store = ctx.store(STORE_NAME)
-    rows = []
-    for key in store.list_keys():
-        if not key.startswith(RUN_PREFIX):
-            continue
-        r = store.get(key) or {}
-        rows.append(
-            {
-                "train_key": r.get("train_key"),
-                "checkpoint_uri": r.get("checkpoint_uri"),
-                "project_url": r.get("project_url"),
-                "eval_key": r.get("eval_key"),
-                "label_field": r.get("label_field"),
-                "created_at": r.get("created_at"),
-                "status": r.get("status") or _DEFAULT_STATUS,
-                "note": r.get("note") or "",
-                "splits": {s: _split_summary(r, s) for s in SPLIT_KEYS},
-            }
-        )
+    """All training runs as ``Row`` dicts, newest first, read from the run
+    framework via the ``_run_row`` adapter."""
+    dataset = ctx.dataset
+    rows = [
+        _run_row(k, dataset.get_training_info(k))
+        for k in dataset.list_training_runs()
+    ]
     rows.sort(key=lambda x: (x.get("created_at") or ""), reverse=True)
     return rows
 
@@ -157,20 +186,23 @@ class TrainingRunsPanel(foo.Panel):
     def open_view(self, ctx):
         train_key = ctx.params.get("train_key")
         split = ctx.params.get("split") or "train"
-        record = get_training_run(ctx.dataset, train_key, store=ctx.store(STORE_NAME))
-        if not record or split not in SPLIT_KEYS or not split_present(record, split):
+        if split not in SPLITS or not ctx.dataset.has_training_run(train_key):
             return
-        ctx.ops.set_view(view=load_split_view(ctx.dataset, record, split))
+        run = ctx.dataset.load_training_run(train_key)
+        view = getattr(run, f"{split}_view", None)
+        if view is None:
+            return
+        ctx.ops.set_view(view)
 
     # --- mutations ---------------------------------------------------------
     def set_status(self, ctx):
         train_key = ctx.params.get("train_key")
         status = ctx.params.get("status")
-        if not train_key or status not in STATUSES:
+        if status not in STATUSES or not ctx.dataset.has_training_run(train_key):
             return
-        update_training_run(
-            ctx.dataset, train_key, store=ctx.store(STORE_NAME), status=status
-        )
+        run = ctx.dataset.load_training_run(train_key)
+        run.config.review_status = status
+        run.save_config()
         ctx.ops.notify(
             f"Status set to '{STATUSES[status]}'", variant="success"
         )
@@ -178,22 +210,19 @@ class TrainingRunsPanel(foo.Panel):
 
     def set_note(self, ctx):
         train_key = ctx.params.get("train_key")
-        if not train_key:
+        if not ctx.dataset.has_training_run(train_key):
             return
-        update_training_run(
-            ctx.dataset,
-            train_key,
-            store=ctx.store(STORE_NAME),
-            note=ctx.params.get("note") or "",
-        )
+        run = ctx.dataset.load_training_run(train_key)
+        run.config.note = ctx.params.get("note") or None
+        run.save_config()
         ctx.ops.notify("Note saved", variant="success")
         self._push(ctx)
 
     def delete_run(self, ctx):
         train_key = ctx.params.get("train_key")
-        if not train_key:
+        if not ctx.dataset.has_training_run(train_key):
             return
-        delete_training_run(ctx.dataset, train_key, store=ctx.store(STORE_NAME))
+        ctx.dataset.delete_training_run(train_key)
         ctx.ops.notify(f"Deleted training run '{train_key}'", variant="success")
         self._push(ctx)
 
@@ -228,14 +257,20 @@ class TrainingRunsPanel(foo.Panel):
     # --- per-split detail (view stages + label distribution) ---------------
     def split_details(self, ctx):
         """Computes, for each recorded split, its view stages and the label-count
-        distribution for the run's label field, and pushes it via ``set_data``."""
+        distribution for the run's label field, and pushes it via ``set_data``.
+
+        Membership (count + distribution) comes from the frozen ``*_view_ids``
+        (the fact); the displayed stage strings are rehydrated from
+        ``*_view_stages`` via the validated ``load_view_stages`` helper (the
+        intent)."""
         train_key = ctx.params.get("train_key")
-        record = get_training_run(ctx.dataset, train_key, store=ctx.store(STORE_NAME))
-        if not record:
+        info = _get_info(ctx.dataset, train_key)
+        if info is None:
             ctx.panel.set_data("split_details", {"train_key": train_key, "splits": {}})
             return
 
-        label_field = record.get("label_field")
+        c = info.config
+        label_field = c.gt_field
         label_path = None
         if label_field:
             try:
@@ -244,10 +279,11 @@ class TrainingRunsPanel(foo.Panel):
                 label_path = None
 
         out = {}
-        for split in SPLIT_KEYS:
-            if not split_present(record, split):
+        for split in SPLITS:
+            ids = getattr(c, f"{split}_view_ids", None)
+            if ids is None:
                 continue
-            view = load_split_view(ctx.dataset, record, split)
+            view = ctx.dataset.select(ids)
             distribution = None
             if label_path:
                 counts = view.count_values(label_path)
@@ -255,9 +291,11 @@ class TrainingRunsPanel(foo.Panel):
                     ({"label": str(k), "count": int(v)} for k, v in counts.items()),
                     key=lambda x: -x["count"],
                 )
+            stages = getattr(c, f"{split}_view_stages", None)
+            rebuilt = fout.load_view_stages(ctx.dataset, stages)
             out[split] = {
                 "num_samples": view.count(),
-                "stages": [str(stage) for stage in view._all_stages],
+                "stages": [str(stage) for stage in rebuilt._all_stages],
                 "label_field": label_field,
                 "distribution": distribution,
             }

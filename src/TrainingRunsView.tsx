@@ -54,6 +54,8 @@ interface Row {
   label_field?: string | null;
   created_at?: string | null;
   status?: string;
+  exec_status?: string;
+  train_config?: Record<string, any> | null;
   note?: string;
   splits?: Partial<Record<Split, SplitInfo>>;
 }
@@ -82,6 +84,26 @@ const DEFAULT_STATUSES: Record<string, string> = {
   candidate: "Candidate",
   promoted: "Promoted",
   archived: "Archived",
+};
+
+// Execution lifecycle (config.status), distinct from the review pill above.
+const EXEC_STATUS_COLOR: Record<string, string> = {
+  declared: "#999999",
+  scheduled: "#82AAFF",
+  queued: "#82AAFF",
+  running: "#FFB682",
+  in_progress: "#FFB682",
+  completed: "#8BC18D",
+  failed: "#FF6B6B",
+};
+const EXEC_STATUS_LABEL: Record<string, string> = {
+  declared: "Declared",
+  scheduled: "Scheduled",
+  queued: "Queued",
+  running: "Running",
+  in_progress: "Running",
+  completed: "Completed",
+  failed: "Failed",
 };
 const ORANGE = "#FF6D04";
 
@@ -173,6 +195,25 @@ function StatusPill({ status, label }: { status: string; label: string }) {
         border: "none",
         backgroundColor: (theme: any) => `${theme.palette.action.selected}!important`,
       }}
+    />
+  );
+}
+
+function ExecStatusPill({ status }: { status?: string }) {
+  const s = status || "declared";
+  const color = EXEC_STATUS_COLOR[s] || EXEC_STATUS_COLOR.declared;
+  const label = EXEC_STATUS_LABEL[s] || s;
+  return (
+    <Chip
+      size="small"
+      variant="outlined"
+      label={
+        <Stack direction="row" spacing={0.5} sx={{ alignItems: "center" }}>
+          <Dot color={color} />
+          <Typography sx={{ color, fontSize: 13 }}>{label}</Typography>
+        </Stack>
+      }
+      sx={{ borderColor: color }}
     />
   );
 }
@@ -307,6 +348,117 @@ function DistributionBars({
         </Button>
       )}
     </Stack>
+  );
+}
+
+function ConfigValue({ value }: { value: any }) {
+  // A long/multiline string is treated as a script; objects are pretty-printed;
+  // scalars render inline.
+  const isScript =
+    typeof value === "string" && (value.includes("\n") || value.length > 200);
+  if (isScript || (typeof value === "object" && value !== null)) {
+    const text =
+      typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    return (
+      <Box
+        component="pre"
+        sx={{
+          m: 0,
+          fontFamily: "monospace",
+          fontSize: 12,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+        }}
+      >
+        {text}
+      </Box>
+    );
+  }
+  if (value === null || value === undefined || value === "")
+    return <Muted>—</Muted>;
+  return <span>{String(value)}</span>;
+}
+
+function TrainingConfigSection({
+  config,
+}: {
+  config?: Record<string, any> | null;
+}) {
+  const [open, setOpen] = useState(false);
+  const entries = config ? Object.entries(config) : [];
+  // A custom-script run carries its source under `script`; everything else is
+  // shown as a parameter table (the builtin "Train model" case).
+  const script =
+    config && typeof config.script === "string" ? config.script : null;
+  const params = entries.filter(([k]) => k !== "script");
+
+  return (
+    <Box>
+      <Stack
+        direction="row"
+        spacing={0.5}
+        onClick={() => setOpen((o) => !o)}
+        sx={{ alignItems: "center", cursor: "pointer", userSelect: "none" }}
+      >
+        <Typography sx={{ width: 16, color: "text.secondary" }}>
+          {open ? "▾" : "▸"}
+        </Typography>
+        <Typography variant="body1" color="secondary">
+          Training configuration
+        </Typography>
+      </Stack>
+      {open && (
+        <Box sx={{ mt: 1 }}>
+          {entries.length === 0 ? (
+            <Muted>No training configuration recorded for this run.</Muted>
+          ) : (
+            <Stack spacing={1.5}>
+              {script !== null && (
+                <Box>
+                  <Typography variant="overline" color="secondary">
+                    Training script
+                  </Typography>
+                  <Box
+                    sx={{
+                      mt: 0.5,
+                      p: 1,
+                      borderRadius: 1,
+                      bgcolor: "action.hover",
+                      maxHeight: 360,
+                      overflow: "auto",
+                    }}
+                  >
+                    <ConfigValue value={script} />
+                  </Box>
+                </Box>
+              )}
+              {params.length > 0 && (
+                <InfoTable size="small" sx={{ width: "auto", maxWidth: 820 }}>
+                  <TableBody>
+                    {params.map(([k, v]) => (
+                      <TableRow key={k}>
+                        <TableCell
+                          sx={{
+                            width: 180,
+                            color: "text.secondary",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {k}
+                        </TableCell>
+                        <TableCell>
+                          <ConfigValue value={v} />
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </InfoTable>
+              )}
+            </Stack>
+          )}
+        </Box>
+      )}
+    </Box>
   );
 }
 
@@ -553,6 +705,7 @@ export default function TrainingRunsView({ data, schema }: Props) {
             </IconButton>
             <RunIcon sx={{ color: ORANGE }} fontSize="small" />
             <Typography sx={{ fontSize: 18, fontWeight: 600 }}>{r.train_key}</Typography>
+            <ExecStatusPill status={r.exec_status} />
             <Select
               value={status}
               onChange={(e) => setStatus(r.train_key, String(e.target.value))}
@@ -615,6 +768,8 @@ export default function TrainingRunsView({ data, schema }: Props) {
                 <PropRow label="Created">{formatCreated(r.created_at)}</PropRow>
               </TableBody>
             </InfoTable>
+
+            <TrainingConfigSection config={r.train_config} />
 
             {r.eval_key && (
               <Box>
@@ -751,6 +906,7 @@ export default function TrainingRunsView({ data, schema }: Props) {
                   </Stack>
                   <Stack direction="row" spacing={0.5} sx={{ alignItems: "center" }}>
                     {r.eval_key && <Chip size="small" variant="outlined" label="eval" />}
+                    <ExecStatusPill status={r.exec_status} />
                     <StatusPill status={status} label={statusLabel(status)} />
                     <IconButton
                       size="small"
@@ -767,6 +923,11 @@ export default function TrainingRunsView({ data, schema }: Props) {
                   {present.map((s) => (
                     <Chip key={s} size="small" variant="outlined" label={s} />
                   ))}
+                  {typeof r.splits?.train?.num_samples === "number" && (
+                    <Typography variant="caption" color="secondary" sx={{ ml: 0.5 }}>
+                      {r.splits.train.num_samples} train samples
+                    </Typography>
+                  )}
                   <Box sx={{ flex: 1 }} />
                   <Typography variant="caption" color="secondary">
                     {formatCreated(r.created_at)}
