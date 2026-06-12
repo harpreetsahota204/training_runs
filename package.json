@@ -11,7 +11,7 @@
     "dev": "vite build --watch",
     "build": "vite build"
   },
-  "dependencies": {
+  "peerDependencies": {
     "@fiftyone/components": "*",
     "@fiftyone/operators": "*",
     "@fiftyone/plugins": "*",
@@ -22,12 +22,21 @@
     "recoil": "^0.7.7",
     "styled-components": "^6.0.0"
   },
+  "peerDependenciesMeta": {
+    "@fiftyone/components": { "optional": true },
+    "@fiftyone/operators": { "optional": true },
+    "@fiftyone/plugins": { "optional": true },
+    "@fiftyone/state": { "optional": true },
+    "@mui/material": { "optional": true },
+    "react": { "optional": true },
+    "react-dom": { "optional": true },
+    "recoil": { "optional": true },
+    "styled-components": { "optional": true }
+  },
   "devDependencies": {
-    "@rollup/plugin-node-resolve": "^15.0.0",
     "@types/node": "^22.7.6",
     "@types/react": "^18.2.0",
     "@vitejs/plugin-react": "^4.3.2",
-    "@voxel51/fiftyone-js-plugin-build": "^2.0.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.9",
     "vite-plugin-externalize-deps": "^0.8.0"

@@ -13,6 +13,8 @@ import {
   DialogTitle,
   IconButton,
   Link,
+  ListItemIcon,
+  ListItemText,
   Menu,
   MenuItem,
   Select,
@@ -144,35 +146,42 @@ const tabsSx: any = {
   },
 };
 
-function RunIcon(props: any) {
-  // "directions_run" — a person running
-  return (
+// Hand-rolled MUI icon paths (@mui/icons-material is not externalized, so we
+// inline the SVG paths rather than bundle the whole icon package).
+function makeIcon(d: string) {
+  return (props: any) => (
     <SvgIcon {...props} viewBox="0 0 24 24">
-      <path d="M13.49 5.48c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm-3.6 13.9l1-4.4 2.1 2v6h2v-7.5l-2.1-2 .6-3c1.3 1.5 3.3 2.5 5.5 2.5v-2c-1.9 0-3.5-1-4.3-2.4l-1-1.6c-.4-.6-1-1-1.7-1-.3 0-.5.1-.8.1l-5.2 2.2v4.7h2v-3.4l1.8-.7-1.6 8.1-4.9-1-.4 2 7 1.4z" />
+      <path d={d} />
     </SvgIcon>
   );
 }
-function BackIcon(props: any) {
-  return (
-    <SvgIcon {...props} viewBox="0 0 24 24">
-      <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
-    </SvgIcon>
-  );
-}
-function AddIcon(props: any) {
-  return (
-    <SvgIcon {...props} viewBox="0 0 24 24">
-      <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
-    </SvgIcon>
-  );
-}
-function MoreVertIcon(props: any) {
-  return (
-    <SvgIcon {...props} viewBox="0 0 24 24">
-      <path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z" />
-    </SvgIcon>
-  );
-}
+
+// "DirectionsRun" — a person running
+const RunIcon = makeIcon(
+  "M13.49 5.48c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm-3.6 13.9l1-4.4 2.1 2v6h2v-7.5l-2.1-2 .6-3c1.3 1.5 3.3 2.5 5.5 2.5v-2c-1.9 0-3.5-1-4.3-2.4l-1-1.6c-.4-.6-1-1-1.7-1-.3 0-.5.1-.8.1l-5.2 2.2v4.7h2v-3.4l1.8-.7-1.6 8.1-4.9-1-.4 2 7 1.4z"
+);
+// "ArrowBack"
+const BackIcon = makeIcon(
+  "M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"
+);
+// "Add"
+const AddIcon = makeIcon("M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z");
+// "MoreVert"
+const MoreVertIcon = makeIcon(
+  "M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"
+);
+// "Science" (beaker/flask)
+const ScienceIcon = makeIcon(
+  "M19.8 18.4 14 10.67V6.5l1.35-1.69c.26-.33.03-.81-.39-.81H9.04c-.42 0-.65.48-.39.81L10 6.5v4.17L4.2 18.4c-.49.66-.02 1.6.8 1.6h14c.82 0 1.29-.94.8-1.6z"
+);
+// "SsidChart" — the builtin Model Evaluation panel's icon
+const SsidChartIcon = makeIcon(
+  "M21 5.47 12 12 7.62 7.62 3 11V8.52L7.83 5l4.38 4.38L21 3zM21 15h-4.7l-4.17 3.34L6 12.41l-3 2.13V17l2.8-2 6.2 6 5-4h4z"
+);
+// "Delete" (trash can)
+const DeleteIcon = makeIcon(
+  "M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"
+);
 function Dot({ color }: { color: string }) {
   return (
     <Box sx={{ width: 8, height: 8, borderRadius: "50%", bgcolor: color, flexShrink: 0 }} />
@@ -220,11 +229,8 @@ function ExecStatusPill({ status }: { status?: string }) {
 
 function formatCreated(iso?: string | null): string {
   if (!iso) return "—";
-  try {
-    return new Date(iso).toLocaleString();
-  } catch {
-    return iso;
-  }
+  const date = new Date(iso);
+  return isNaN(date.getTime()) ? iso : date.toLocaleString();
 }
 
 function Muted({ children }: { children: React.ReactNode }) {
@@ -578,7 +584,7 @@ export default function TrainingRunsView({ data, schema }: Props) {
   const call = useCallback(
     (name: string, uri?: string, params: Record<string, unknown> = {}) => {
       if (!uri) {
-        console.warn("[tr][js] NO METHOD URI for", name, "— view keys:", Object.keys(view));
+        console.warn(`TrainingRunsView: no method URI for "${name}"`);
         return;
       }
       triggerEvent(uri, params);
@@ -614,9 +620,37 @@ export default function TrainingRunsView({ data, schema }: Props) {
   };
   const closeMenu = () => setMenuAnchor(null);
 
+  const menuRow = menuRun ? rows.find((r) => r.train_key === menuRun) : undefined;
+
   const overlays = (
     <>
       <Menu anchorEl={menuAnchor} open={Boolean(menuAnchor)} onClose={closeMenu}>
+        {menuRow?.project_url && (
+          <MenuItem
+            onClick={() => {
+              window.open(menuRow.project_url as string, "_blank", "noopener");
+              closeMenu();
+            }}
+          >
+            <ListItemIcon>
+              <ScienceIcon fontSize="small" />
+            </ListItemIcon>
+            <ListItemText>View experiment</ListItemText>
+          </MenuItem>
+        )}
+        {menuRow?.eval_key && (
+          <MenuItem
+            onClick={() => {
+              openEval(menuRow.eval_key);
+              closeMenu();
+            }}
+          >
+            <ListItemIcon>
+              <SsidChartIcon fontSize="small" />
+            </ListItemIcon>
+            <ListItemText>Load evaluation results</ListItemText>
+          </MenuItem>
+        )}
         <MenuItem
           onClick={() => {
             setDeleteTarget(menuRun);
@@ -624,7 +658,10 @@ export default function TrainingRunsView({ data, schema }: Props) {
           }}
           sx={{ color: "error.main" }}
         >
-          Delete training run
+          <ListItemIcon>
+            <DeleteIcon fontSize="small" sx={{ color: "error.main" }} />
+          </ListItemIcon>
+          <ListItemText>Delete training run</ListItemText>
         </MenuItem>
       </Menu>
       <Dialog open={Boolean(deleteTarget)} onClose={() => setDeleteTarget(null)}>

@@ -76,7 +76,7 @@ def _eval_id(dataset, eval_key):
     """The evaluation's document id (str), or None."""
     try:
         return str(dataset._doc.evaluations[eval_key].id)
-    except Exception:
+    except (KeyError, AttributeError):
         return None
 
 
@@ -163,22 +163,39 @@ class TrainingRunsPanel(foo.Panel):
 
     # --- navigation actions ------------------------------------------------
     def open_eval(self, ctx):
-        # Opens the builtin Model Evaluation panel (does NOT touch the grid view).
-        # Routes through the ``data`` store only -- the panel's React component
-        # reads ``data.view.page`` -- mirroring how the Similarity panel deep-links.
+        # Deep-links the builtin Model Evaluation panel to this eval (does NOT
+        # touch the grid view). Three quirks dictate the shape of this call:
+        #
+        # 1) The payload must go in panel STATE, not data: the React side
+        #    renders from a state+data merge either way, but the eval panel's
+        #    Python handlers (load_evaluation et al) resolve the key via
+        #    ``ctx.panel.get_state("view")``, which only sees state.
+        # 2) open_panel writes its ``state`` param WHOLESALE as the panel's
+        #    state envelope, of which only the ``state`` key reaches
+        #    ``get_state`` -- hence the outer "state" nesting.
+        # 3) If the panel is already open, open_panel just focuses it and
+        #    drops the payload entirely -- so close it first to force the
+        #    initializePanel path.
+        #
+        # ``init: True`` stops the panel's on_load from resetting the view
+        # back to its overview page.
         eval_key = ctx.params.get("eval_key")
         if not eval_key:
             return
+        ctx.ops.close_panel(name=_EVAL_PANEL)
         ctx.ops.open_panel(
             _EVAL_PANEL,
             is_active=True,
             layout="horizontal",
             force=True,
-            data={
-                "view": {
-                    "page": "evaluation",
-                    "key": eval_key,
-                    "id": _eval_id(ctx.dataset, eval_key),
+            state={
+                "state": {
+                    "view": {
+                        "page": "evaluation",
+                        "key": eval_key,
+                        "id": _eval_id(ctx.dataset, eval_key),
+                        "init": True,
+                    }
                 }
             },
         )

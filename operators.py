@@ -39,14 +39,6 @@ def _view_dropdown(ctx, optional=False):
     return values, view
 
 
-def _eval_dropdown(ctx):
-    evals = ctx.dataset.list_evaluations()
-    view = types.DropdownView()
-    for ek in evals:
-        view.add_choice(ek, label=ek)
-    return evals, view
-
-
 def _label_input(inputs, ctx, default=None):
     fields = _label_fields(ctx)
     view = types.DropdownView()
@@ -64,7 +56,10 @@ def _label_input(inputs, ctx, default=None):
 
 
 def _eval_input(inputs, ctx, default=None):
-    evals, view = _eval_dropdown(ctx)
+    evals = ctx.dataset.list_evaluations()
+    view = types.DropdownView()
+    for ek in evals:
+        view.add_choice(ek, label=ek)
     inputs.enum(
         "eval_key",
         evals,
