@@ -4,8 +4,9 @@ The Training Runs panel.
 A Python ``Panel`` that owns the data + actions and delegates rendering to a
 React component (``TrainingRunsView``) via ``composite_view=True``. Panel
 methods are wired straight to the frontend -- no standalone operators -- and
-data is pushed to React through ``ctx.panel.set_data``. After the Log/Edit
-forms succeed, ``on_success`` re-pushes the rows so the panel refreshes itself.
+data is pushed to React through ``ctx.panel.set_data``. After the Log/Edit/
+Evaluate forms succeed, ``on_success`` re-pushes the rows so the panel
+refreshes itself.
 """
 
 import fiftyone.operators as foo
@@ -37,12 +38,22 @@ def _split_info(config, split):
     }
 
 
-def _run_row(key, info):
+def _eval_meta(dataset, eval_key):
+    """The linked eval's ``(type, method)``, or ``(None, None)`` if the eval
+    is absent (never linked, or deleted out from under the run)."""
+    if not eval_key or eval_key not in dataset.list_evaluations():
+        return None, None
+    config = dataset.get_evaluation_info(eval_key).config
+    return getattr(config, "type", None), getattr(config, "method", None)
+
+
+def _run_row(dataset, key, info):
     """Adapts a :class:`TrainingInfo` into the ``Row`` shape the React panel
     consumes. The single seam between the run framework and the panel: every
     other handler maps 1:1 to an SDK call.
 
     Args:
+        dataset: the :class:`fiftyone.core.dataset.Dataset`
         key: the ``train_key``
         info: the :class:`fiftyone.core.training.TrainingInfo`
 
@@ -51,18 +62,23 @@ def _run_row(key, info):
     """
     c = info.config
     timestamp = getattr(info, "timestamp", None)
+    # drives the type-specific eval icon, mirroring the Model Evaluation
+    # panel's EvaluationIcon mapping
+    eval_type, eval_method = _eval_meta(dataset, c.eval_key)
     return {
         "train_key": key,
         "checkpoint_uri": c.checkpoint_uri,
         "project_url": c.project_url,
         "eval_key": c.eval_key,
+        "eval_type": eval_type,
+        "eval_method": eval_method,
         # the panel's "Label field" is the run's ground-truth field
         "label_field": c.gt_field,
         # Row types created_at as string|null -> serialize in the adapter
         "created_at": timestamp.isoformat() if timestamp else None,
         # review pill, NOT execution status (config.status)
         "status": c.review_status or "new",
-        # execution lifecycle: declared/running/completed/failed (+ the
+        # execution lifecycle: declared/in_progress/completed/failed (+ the
         # scheduled/queued states the delegated path will add later)
         "exec_status": c.status or "declared",
         # opaque per-run training params / script (rendered read-only)
@@ -110,7 +126,7 @@ def _runs_rows(ctx):
     framework via the ``_run_row`` adapter."""
     dataset = ctx.dataset
     rows = [
-        _run_row(k, dataset.get_training_info(k))
+        _run_row(dataset, k, dataset.get_training_info(k))
         for k in dataset.list_training_runs()
     ]
     rows.sort(key=lambda x: (x.get("created_at") or ""), reverse=True)
@@ -150,16 +166,22 @@ class TrainingRunsPanel(foo.Panel):
         )
 
     # --- form launchers (auto-refresh via on_success) ----------------------
+    def _prompt_run_form(self, ctx, operator):
+        """Prompts a form operator, pre-selecting the run being viewed."""
+        train_key = ctx.params.get("train_key")
+        params = {"train_key": train_key} if train_key else None
+        ctx.prompt(
+            f"{_PLUGIN}/{operator}", params=params, on_success=self.refresh
+        )
+
     def open_log(self, ctx):
         ctx.prompt(f"{_PLUGIN}/log_training_run", on_success=self.refresh)
 
     def open_edit(self, ctx):
-        # Pre-select the run being viewed so the Edit form opens on it directly.
-        train_key = ctx.params.get("train_key")
-        params = {"train_key": train_key} if train_key else None
-        ctx.prompt(
-            f"{_PLUGIN}/edit_training_run", params=params, on_success=self.refresh
-        )
+        self._prompt_run_form(ctx, "edit_training_run")
+
+    def open_evaluate(self, ctx):
+        self._prompt_run_form(ctx, "evaluate_training_run")
 
     # --- navigation actions ------------------------------------------------
     def open_eval(self, ctx):
@@ -334,6 +356,7 @@ class TrainingRunsPanel(foo.Panel):
                 open_log=self.open_log,
                 open_edit=self.open_edit,
                 open_eval=self.open_eval,
+                open_evaluate=self.open_evaluate,
                 open_view=self.open_view,
                 set_status=self.set_status,
                 set_note=self.set_note,

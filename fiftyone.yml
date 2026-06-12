@@ -13,6 +13,7 @@ fiftyone:
 operators:
   - log_training_run
   - edit_training_run
+  - evaluate_training_run
   - open_training_runs_panel
 panels:
   - training_runs

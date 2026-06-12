@@ -1,13 +1,18 @@
 """
-Operators: the App-facing forms. These ASSOCIATE; they never run training, and
-they never run eval (the eval is selected from existing runs). All persistence
-goes through the training-run framework (``dataset.add_training_run`` etc.).
+Operators: the App-facing forms. The Log/Edit forms ASSOCIATE (they never run
+training or eval); the Evaluate form runs a real FO evaluation through the
+engine surface (``run.evaluate()``), which welds it to the run. All
+persistence goes through the training-run framework
+(``dataset.add_training_run`` etc.).
 """
+
+import json
 
 import fiftyone.core.evaluation as foev
 import fiftyone.core.labels as fol
 import fiftyone.operators as foo
 import fiftyone.operators.types as types
+import fiftyone.utils.training as fout
 
 _NONE = "__none__"
 _CURRENT = "__current__"
@@ -22,6 +27,14 @@ def _label_fields(ctx):
         if isinstance(doc_type, type) and issubclass(doc_type, fol.Label):
             out.append(name)
     return out
+
+
+def _dropdown(values):
+    """A DropdownView whose choices are the given values, labeled as-is."""
+    view = types.DropdownView()
+    for v in values:
+        view.add_choice(v, label=v)
+    return view
 
 
 def _view_dropdown(ctx, optional=False):
@@ -41,15 +54,12 @@ def _view_dropdown(ctx, optional=False):
 
 def _label_input(inputs, ctx, default=None):
     fields = _label_fields(ctx)
-    view = types.DropdownView()
-    for name in fields:
-        view.add_choice(name, label=name)
     inputs.enum(
         "label_field",
         fields,
         required=False,
         default=default,
-        view=view,
+        view=_dropdown(fields),
         label="Label field (optional)",
         description="The ground-truth label field the model trained on",
     )
@@ -57,15 +67,12 @@ def _label_input(inputs, ctx, default=None):
 
 def _eval_input(inputs, ctx, default=None):
     evals = ctx.dataset.list_evaluations()
-    view = types.DropdownView()
-    for ek in evals:
-        view.add_choice(ek, label=ek)
     inputs.enum(
         "eval_key",
         evals,
         required=False,
         default=default,
-        view=view,
+        view=_dropdown(evals),
         label="Associated eval run (optional)",
         description="An existing evaluation to associate with this run",
     )
@@ -231,10 +238,13 @@ class EditTrainingRun(foo.Operator):
             inputs.view("warning", types.Warning(label="No training runs to edit"))
             return types.Property(inputs)
 
-        key_view = types.DropdownView()
-        for k in keys:
-            key_view.add_choice(k, label=k)
-        inputs.enum("train_key", keys, required=True, view=key_view, label="Training run")
+        inputs.enum(
+            "train_key",
+            keys,
+            required=True,
+            view=_dropdown(keys),
+            label="Training run",
+        )
 
         train_key = ctx.params.get("train_key")
         if not train_key or not ctx.dataset.has_training_run(train_key):
@@ -271,6 +281,273 @@ class EditTrainingRun(foo.Operator):
 
         ctx.ops.notify(f"Updated training run '{train_key}'", variant="success")
         return {"train_key": train_key}
+
+
+def _populated_pred_count(dataset, config, pred_field):
+    """The number of samples across the run's frozen splits with populated
+    predictions in ``pred_field``."""
+    ids = []
+    for split in ("train", "val", "test"):
+        ids += getattr(config, f"{split}_view_ids", None) or []
+    ids = list(dict.fromkeys(ids))
+    if not ids:
+        return 0
+    return dataset.select(ids).exists(pred_field).count()
+
+
+class EvaluateTrainingRun(foo.Operator):
+    """Runs a real FO evaluation for a completed run with no linked eval.
+
+    Everything goes through the engine surface (``run.evaluate()``), so the
+    weld (forward ``eval_key`` + ``train_key`` back-pointer) comes for free.
+    The form is type-aware: the eval method's inputs are chosen by the gt
+    field's label type, via the same ``resolve_eval_kind`` the engine uses.
+    """
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="evaluate_training_run",
+            label="Evaluate Training Run",
+            dynamic=True,
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+
+        # Eligible: completed runs with no linked eval
+        keys = [
+            k
+            for k in ctx.dataset.list_training_runs(status="completed")
+            if ctx.dataset.get_training_info(k).config.eval_key is None
+        ]
+        if not keys:
+            inputs.view(
+                "warning",
+                types.Warning(
+                    label="No completed training runs without an evaluation"
+                ),
+            )
+            return types.Property(inputs)
+
+        inputs.enum(
+            "train_key",
+            keys,
+            required=True,
+            view=_dropdown(keys),
+            label="Training run",
+        )
+
+        train_key = ctx.params.get("train_key")
+        if train_key not in keys:
+            return types.Property(inputs)  # dynamic: fields appear after selection
+
+        c = ctx.dataset.get_training_info(train_key).config
+
+        # Door-3 runs may lack gt/pred fields; collect whichever are missing
+        fields = _label_fields(ctx)
+        for param, label in (
+            ("gt_field", "Ground truth field"),
+            ("pred_field", "Predictions field"),
+        ):
+            if getattr(c, param) is None:
+                inputs.enum(
+                    param,
+                    fields,
+                    required=True,
+                    view=_dropdown(fields),
+                    label=label,
+                    description=f"This run has no recorded {label.lower()}",
+                )
+
+        gt_field = c.gt_field or ctx.params.get("gt_field")
+        pred_field = c.pred_field or ctx.params.get("pred_field")
+        if not gt_field or not pred_field:
+            return types.Property(inputs)
+
+        # No predictions on the run's frozen views -> nothing to evaluate
+        n_preds = _populated_pred_count(ctx.dataset, c, pred_field)
+        if n_preds == 0:
+            inputs.view(
+                "no_preds",
+                types.Error(
+                    label=f"No predictions found in '{pred_field}'",
+                    description=(
+                        "None of this run's frozen samples have predictions "
+                        "in that field. Apply your model first, then evaluate."
+                    ),
+                ),
+            )
+            return types.Property(inputs)
+
+        try:
+            kind = fout.resolve_eval_kind(ctx.dataset, gt_field)
+        except ValueError as e:
+            inputs.view("bad_kind", types.Error(label=str(e)))
+            return types.Property(inputs)
+
+        inputs.view(
+            "info",
+            types.Notice(
+                label=(
+                    f"{kind} evaluation: '{pred_field}' vs '{gt_field}' on "
+                    f"{n_preds} predicted samples"
+                )
+            ),
+        )
+
+        inputs.str(
+            "eval_key",
+            default=train_key,
+            required=True,
+            label="Evaluation key",
+            description="Defaults to the training run's name",
+        )
+
+        if kind == "detection":
+            inputs.float(
+                "iou",
+                default=0.5,
+                label="IoU threshold",
+                description="Matching threshold between predicted and GT objects",
+            )
+            inputs.bool(
+                "classwise",
+                default=True,
+                label="Classwise",
+                description="Only match objects with the same class label",
+            )
+            inputs.bool(
+                "compute_mAP",
+                default=False,
+                label="Compute mAP",
+                description=(
+                    "Sweep all IoUs to compute mAP (slower; required for "
+                    "PR curves)"
+                ),
+            )
+        elif kind == "classification":
+            methods = ["simple", "top-k", "binary"]
+            inputs.enum(
+                "method",
+                methods,
+                default="simple",
+                view=_dropdown(methods),
+                label="Method",
+                description="top-k requires logits; binary requires two classes",
+            )
+            method = ctx.params.get("method", "simple")
+            if method == "top-k":
+                inputs.int("k", default=5, label="k")
+            elif method == "binary":
+                inputs.str(
+                    "classes",
+                    required=True,
+                    label="Classes (neg,pos)",
+                    description="Comma-separated: negative label, positive label",
+                )
+        # segmentation / regression: the defaults are the sensible prototype
+        # surface; anything deeper goes through the advanced kwargs below
+
+        inputs.str(
+            "eval_kwargs",
+            view=types.CodeView(language="json"),
+            label="Advanced kwargs (JSON, optional)",
+            description=(
+                f"Extra kwargs passed to evaluate_{kind}s(), e.g. "
+                '{"use_masks": true}'
+            ),
+        )
+        return types.Property(inputs)
+
+    def _build_eval_kwargs(self, ctx, kind):
+        """Assembles the ``evaluate_*`` kwargs from the form params.
+
+        Raises:
+            ValueError: if the advanced-kwargs JSON is invalid
+        """
+        kwargs = {}
+        if kind == "detection":
+            kwargs["iou"] = ctx.params.get("iou", 0.5)
+            kwargs["classwise"] = ctx.params.get("classwise", True)
+            kwargs["compute_mAP"] = ctx.params.get("compute_mAP", False)
+        elif kind == "classification":
+            method = ctx.params.get("method", "simple")
+            kwargs["method"] = method
+            if method == "top-k":
+                kwargs["k"] = ctx.params.get("k", 5)
+            elif method == "binary":
+                classes = [
+                    s.strip()
+                    for s in (ctx.params.get("classes") or "").split(",")
+                    if s.strip()
+                ]
+                if len(classes) != 2:
+                    raise ValueError(
+                        "Binary evaluation requires exactly two classes: "
+                        "negative,positive"
+                    )
+                kwargs["classes"] = classes
+
+        raw = ctx.params.get("eval_kwargs")
+        if raw:
+            try:
+                extra = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid advanced kwargs JSON: {e}")
+            if not isinstance(extra, dict):
+                raise ValueError("Advanced kwargs must be a JSON object")
+            kwargs.update(extra)
+
+        return kwargs
+
+    def execute(self, ctx):
+        train_key = ctx.params["train_key"]
+        run = ctx.dataset.load_training_run(train_key)
+        c = run.config
+
+        # Fill in fields a door-3 run may lack (run-framework write, same
+        # pattern as the Edit form)
+        changed = False
+        for field in ("gt_field", "pred_field"):
+            if getattr(c, field) is None and ctx.params.get(field):
+                setattr(c, field, ctx.params[field])
+                changed = True
+        if changed:
+            run.save_config()
+
+        eval_key = ctx.params.get("eval_key") or train_key
+        if not eval_key.isidentifier():
+            ctx.ops.notify(
+                f"'{eval_key}' is not a valid evaluation key: use letters, "
+                "digits and underscores, and don't start with a digit.",
+                variant="error",
+            )
+            return
+        if eval_key in ctx.dataset.list_evaluations():
+            ctx.ops.notify(
+                f"An evaluation '{eval_key}' already exists on this dataset",
+                variant="error",
+            )
+            return
+
+        try:
+            kind = fout.resolve_eval_kind(ctx.dataset, c.gt_field)
+            kwargs = self._build_eval_kwargs(ctx, kind)
+            # The engine runs the eval on the union of the run's populated
+            # splits and welds it (eval_key forward, train_key back)
+            run.evaluate(eval_key=eval_key, **kwargs)
+        except Exception as e:
+            # Boundary: surface eval failures (bad kwargs, missing logits,
+            # etc.) as a readable notification instead of an operator crash
+            ctx.ops.notify(str(e), variant="error")
+            return
+
+        ctx.ops.notify(
+            f"Evaluated training run '{train_key}' -> eval '{eval_key}'",
+            variant="success",
+        )
+        return {"train_key": train_key, "eval_key": eval_key}
 
 
 class OpenTrainingRunsPanel(foo.Operator):

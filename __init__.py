@@ -30,6 +30,7 @@ for _sub in ("operators", "panel"):
 from .operators import (
     LogTrainingRun,
     EditTrainingRun,
+    EvaluateTrainingRun,
     OpenTrainingRunsPanel,
 )
 from .panel import TrainingRunsPanel
@@ -38,5 +39,6 @@ from .panel import TrainingRunsPanel
 def register(p):
     p.register(LogTrainingRun)
     p.register(EditTrainingRun)
+    p.register(EvaluateTrainingRun)
     p.register(OpenTrainingRunsPanel)
     p.register(TrainingRunsPanel)

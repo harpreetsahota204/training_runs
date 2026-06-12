@@ -53,6 +53,8 @@ interface Row {
   checkpoint_uri?: string | null;
   project_url?: string | null;
   eval_key?: string | null;
+  eval_type?: string | null;
+  eval_method?: string | null;
   label_field?: string | null;
   created_at?: string | null;
   status?: string;
@@ -178,10 +180,52 @@ const ScienceIcon = makeIcon(
 const SsidChartIcon = makeIcon(
   "M21 5.47 12 12 7.62 7.62 3 11V8.52L7.83 5l4.38 4.38L21 3zM21 15h-4.7l-4.17 3.34L6 12.41l-3 2.13V17l2.8-2 6.2 6 5-4h4z"
 );
+// Per-eval-type icons, mirroring the Model Evaluation panel's EvaluationIcon
+// "CrisisAlertOutlined" (detection)
+const CrisisAlertIcon = makeIcon(
+  "M14.5 2.5c0 1.5-1.5 6-1.5 6h-2S9.5 4 9.5 2.5C9.5 1.12 10.62 0 12 0s2.5 1.12 2.5 2.5M12 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2m4.08-4.89c.18-.75.33-1.47.39-2.06C19.75 4.69 22 8.08 22 12c0 5.52-4.48 10-10 10S2 17.52 2 12c0-3.92 2.25-7.31 5.53-8.95.07.59.21 1.32.39 2.06C5.58 6.51 4 9.07 4 12c0 4.42 3.58 8 8 8s8-3.58 8-8c0-2.93-1.58-5.49-3.92-6.89M18 12c0 3.31-2.69 6-6 6s-6-2.69-6-6c0-2 .98-3.77 2.48-4.86.23.81.65 2.07.65 2.07C8.43 9.93 8 10.92 8 12c0 2.21 1.79 4 4 4s4-1.79 4-4c0-1.08-.43-2.07-1.13-2.79 0 0 .41-1.22.65-2.07C17.02 8.23 18 10 18 12"
+);
+// "Layers" (classification)
+const LayersIcon = makeIcon(
+  "m11.99 18.54-7.37-5.73L3 14.07l9 7 9-7-1.63-1.27zM12 16l7.36-5.73L21 9l-9-7-9 7 1.63 1.27z"
+);
+// "CallSplitOutlined" (binary classification)
+const CallSplitIcon = makeIcon(
+  "m14 4 2.29 2.29-2.88 2.88 1.42 1.42 2.88-2.88L20 10V4zm-4 0H4v6l2.29-2.29 4.71 4.7V20h2v-8.41l-5.29-5.3z"
+);
+// "PieChartOutlined" (segmentation)
+const PieChartIcon = makeIcon(
+  "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2m7.93 9H13V4.07c3.61.45 6.48 3.32 6.93 6.93M4 12c0-4.07 3.06-7.44 7-7.93v15.86c-3.94-.49-7-3.86-7-7.93m9 7.93V13h6.93c-.45 3.61-3.32 6.48-6.93 6.93"
+);
+// "ShowChartOutlined" (regression)
+const ShowChartIcon = makeIcon(
+  "m3.5 18.49 6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z"
+);
 // "Delete" (trash can)
 const DeleteIcon = makeIcon(
   "M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"
 );
+
+// The eval card color in the Model Evaluation panel
+const EVAL_ICON_COLOR = "#FFC48B";
+
+function EvalTypeIcon({
+  type,
+  method,
+  ...props
+}: {
+  type?: string | null;
+  method?: string | null;
+  [key: string]: any;
+}) {
+  // Same mapping as the Model Evaluation panel's EvaluationIcon
+  let Icon = LayersIcon;
+  if (type === "classification" && method === "binary") Icon = CallSplitIcon;
+  else if (type === "detection") Icon = CrisisAlertIcon;
+  else if (type === "segmentation") Icon = PieChartIcon;
+  else if (type === "regression") Icon = ShowChartIcon;
+  return <Icon {...props} sx={{ color: EVAL_ICON_COLOR }} />;
+}
 function Dot({ color }: { color: string }) {
   return (
     <Box sx={{ width: 8, height: 8, borderRadius: "50%", bgcolor: color, flexShrink: 0 }} />
@@ -600,6 +644,8 @@ export default function TrainingRunsView({ data, schema }: Props) {
     call("delete_run", view.delete_run, { train_key: trainKey });
   const openEval = (evalKey?: string | null) =>
     evalKey && call("open_eval", view.open_eval, { eval_key: evalKey });
+  const openEvaluate = (trainKey: string) =>
+    call("open_evaluate", view.open_evaluate, { train_key: trainKey });
   const openView = (trainKey: string, split: Split) =>
     call("open_view", view.open_view, { train_key: trainKey, split });
   const setStatus = (trainKey: string, status: string) =>
@@ -646,9 +692,26 @@ export default function TrainingRunsView({ data, schema }: Props) {
             }}
           >
             <ListItemIcon>
-              <SsidChartIcon fontSize="small" />
+              <EvalTypeIcon
+                type={menuRow.eval_type}
+                method={menuRow.eval_method}
+                fontSize="small"
+              />
             </ListItemIcon>
             <ListItemText>Load evaluation results</ListItemText>
+          </MenuItem>
+        )}
+        {menuRow && !menuRow.eval_key && menuRow.exec_status === "completed" && (
+          <MenuItem
+            onClick={() => {
+              openEvaluate(menuRow.train_key);
+              closeMenu();
+            }}
+          >
+            <ListItemIcon>
+              <SsidChartIcon fontSize="small" />
+            </ListItemIcon>
+            <ListItemText>Evaluate</ListItemText>
           </MenuItem>
         )}
         <MenuItem
@@ -823,6 +886,22 @@ export default function TrainingRunsView({ data, schema }: Props) {
                   </Button>
                 </Stack>
                 <EvalSummaryView summary={currentEvalSummary} />
+              </Box>
+            )}
+
+            {!r.eval_key && r.exec_status === "completed" && (
+              <Box>
+                <Typography variant="body1" color="secondary" sx={{ mb: 1 }}>
+                  Evaluation
+                </Typography>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  startIcon={<SsidChartIcon fontSize="small" />}
+                  onClick={() => openEvaluate(r.train_key)}
+                >
+                  Evaluate model
+                </Button>
               </Box>
             )}
 
