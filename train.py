@@ -25,7 +25,7 @@ import fiftyone.operators.types as types
 
 from . import train_hf, train_yolo
 from . import training_helpers as th
-from .operators import _dropdown, _valid_identifier
+from .operators import _dropdown, _valid_identifier, label_fields_for
 
 _FRAMEWORK_LABELS = {
     "ultralytics": "Ultralytics YOLO",
@@ -76,7 +76,7 @@ def _fields_for_task(ctx, task):
     field qualifies only with instance masks and a ``Polylines`` field only
     when filled (a semantic ``Segmentation`` field always qualifies).
     """
-    fields = th.label_fields_for(ctx, _task_label_types(task))
+    fields = label_fields_for(ctx, _task_label_types(task))
     if task != "segmentation":
         return fields
 

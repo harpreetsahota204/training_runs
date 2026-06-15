@@ -28,16 +28,6 @@ def page(inputs):
     return types.Property(inputs, view=types.View(label=_TITLE))
 
 
-def label_fields_for(ctx, accepted_types):
-    """Top-level label fields whose document type is one of ``accepted_types``."""
-    out = []
-    for name, field in ctx.dataset.get_field_schema().items():
-        doc_type = getattr(field, "document_type", None)
-        if isinstance(doc_type, type) and issubclass(doc_type, accepted_types):
-            out.append(name)
-    return out
-
-
 def label_type(ctx, field):
     """The :class:`fiftyone.core.labels.Label` subclass of ``field``, or None."""
     schema_field = ctx.dataset.get_field_schema().get(field)
