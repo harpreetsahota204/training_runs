@@ -2,12 +2,18 @@
 """
 Validate the `exp-model-train-log` training-run branch end to end.
 
-Runs Brian's two SDK halves against the `quickstart` dataset and writes a full
-report to a .txt you can paste back for diagnosis:
+Runs the SDK engine end to end against the `quickstart` dataset and writes a
+full report to a .txt you can paste back for diagnosis:
 
   * Section 4.2 (write path): init_training_run -> finish (+auto-eval) -> linkage,
-    log_predictions, context-manager lifecycle.
+    log_predictions, context-manager lifecycle, one-call add_training_run, the
+    door-3 "link existing eval" profile, and the 1:1 eval-weld policy.
   * Section 4.4 (read/manage): has/list/get/load/rename/delete.
+  * Contracts: eval_key defaults to train_key; keys are NOT slugged (a
+    non-identifier raises); gt/pred required iff an eval runs; auto_eval=None
+    inference; view-stage capture + rehydration; review_status/note round-trip.
+  * App surface (best-effort): the plugin's operators + panel are registered
+    (SKIPs if the plugin isn't installed yet -- the engine checks still run).
 
 Design notes:
   - Every step runs INDEPENDENTLY in its own try/except. One failure does not
@@ -167,11 +173,8 @@ def s2_init_run():
     S["run"] = run
     print("status    :", getattr(run, "status", "<no .status>"))
     print("train_key :", getattr(run, "train_key", "<no .train_key>"))
-    try:
-        print("splits    : train=%d val=%d test=%d" % (
-            run.train_view.count(), run.val_view.count(), run.test_view.count()))
-    except Exception as e:
-        print("split view access error:", e)
+    print("splits    : train=%d val=%d test=%d" % (
+        run.train_view.count(), run.val_view.count(), run.test_view.count()))
     print("eval_key  :", getattr(run, "eval_key", "<no .eval_key>"))
     # view stages (intent) captured alongside ids (fact); names are None
     # because live views, not saved-view names, were passed
@@ -198,10 +201,13 @@ def s3_finish():
     print("status        :", getattr(run, "status", "?"))
     print("eval_key      :", getattr(run, "eval_key", "?"))
     print("checkpoint_uri:", getattr(run, "checkpoint_uri", "?"))
-    try:
-        print("eval_view     :", run.eval_view.count(), "samples")
-    except Exception as e:
-        print("eval_view access error:", e)
+    print("eval_view     :", run.eval_view.count(), "samples")
+    # finished + auto-eval ran; eval_key DEFAULTS to train_key (no override)
+    assert run.status == "completed", "finish() should leave status=completed"
+    assert run.eval_key == S["key"], (
+        "eval_key should default to train_key (%r), got %r"
+        % (S["key"], run.eval_key)
+    )
 
 def s4_linkage():
     need("fo", "dataset", "run", "key")
@@ -209,15 +215,9 @@ def s4_linkage():
     run = S["run"]
     key = S["key"]
     res = S.get("eval_results")
-    # forward
+    # forward: print the eval report (auto-eval here is always a detection eval)
     if res is not None:
-        try:
-            res.print_report()
-        except Exception:
-            try:
-                print("metrics:", res.metrics())
-            except Exception as e:
-                print("no print_report/metrics:", e)
+        res.print_report()
     # back-pointer
     ek = run.eval_key
     einfo = dataset.get_evaluation_info(ek)
@@ -229,21 +229,11 @@ def s5_discovery():
     need("dataset", "key")
     dataset = S["dataset"]
     key = S["key"]
-    # has_training_runs: property OR method? report which.
-    try:
-        val = dataset.has_training_runs
-        if callable(val):
-            print("has_training_runs : METHOD ->", dataset.has_training_runs())
-        else:
-            print("has_training_runs : PROPERTY ->", val)
-    except Exception as e:
-        print("has_training_runs error:", e)
+    # has_training_runs is a property (verified fact); access it directly
+    print("has_training_runs     :", dataset.has_training_runs)
     print("has_training_run(key) :", dataset.has_training_run(key))
     print("list_training_runs()  :", dataset.list_training_runs())
-    try:
-        print("list(status=completed):", dataset.list_training_runs(status="completed"))
-    except Exception as e:
-        print("status filter error:", e)
+    print("list(status=completed):", dataset.list_training_runs(status="completed"))
 
 def s6_get_info():
     need("dataset", "key")
@@ -306,12 +296,9 @@ def s7_reload():
     print("reloaded type   :", type(r).__name__)
     print("reloaded status :", getattr(r, "status", "?"))
     print("reloaded eval_key:", getattr(r, "eval_key", "?"))
-    try:
-        print("reloaded eval_view:", r.eval_view.count())
-        print("reloaded splits  : train=%d val=%d test=%d" % (
-            r.train_view.count(), r.val_view.count(), r.test_view.count()))
-    except Exception as e:
-        print("reloaded view access error:", e)
+    print("reloaded eval_view:", r.eval_view.count())
+    print("reloaded splits  : train=%d val=%d test=%d" % (
+        r.train_view.count(), r.val_view.count(), r.test_view.count()))
 
 def s8_log_predictions():
     need("fo", "dataset")
@@ -412,16 +399,11 @@ def s9b_one_call():
 def s10_teardown():
     need("dataset")
     dataset = S["dataset"]
-    try:
-        dataset.rename_training_run("ctx_clean", "ctx_clean_renamed")
-        print("after rename    :", dataset.list_training_runs())
-    except Exception as e:
-        print("rename error:", e)
-    try:
-        dataset.delete_training_run("ctx_boom")
-        print("after delete one:", dataset.list_training_runs())
-    except Exception as e:
-        print("delete one error:", e)
+    # rename + delete ARE the §4.4 surface under test -- let them bubble
+    dataset.rename_training_run("ctx_clean", "ctx_clean_renamed")
+    print("after rename    :", dataset.list_training_runs())
+    dataset.delete_training_run("ctx_boom")
+    print("after delete one:", dataset.list_training_runs())
     dataset.delete_training_runs()
     print("after delete all:", dataset.list_training_runs())
 
@@ -536,6 +518,110 @@ def s12_weld_policy():
     )
 
 
+def s13_key_policy():
+    """Input contracts at init time: keys are NOT slugged (a non-identifier
+    raises), and gt/pred are required iff THIS engine will run the eval."""
+    need("fo", "dataset")
+    dataset = S["dataset"]
+    # (a) a non-identifier key is rejected -- NO silent slugging (RD1)
+    rejected = False
+    try:
+        dataset.init_training_run(
+            train_key="my-bad-key",   # hyphen => not a valid identifier
+            train_view=dataset.match_tags("train"),
+        )
+    except ValueError as e:
+        rejected = True
+        print("invalid key rejected:", e)
+    assert rejected, "a non-identifier train_key must raise (no slugging)"
+    assert not dataset.has_training_run("my-bad-key"), (
+        "a rejected key must not leave a registered run behind"
+    )
+    # (b) auto_eval=True requires gt/pred (branch-conditional validation)
+    missing = False
+    try:
+        dataset.init_training_run(
+            train_key="needs_fields",
+            train_view=dataset.match_tags("train"),
+            test_view=dataset.match_tags("test"),
+            auto_eval=True,   # engine will run the eval -> gt/pred required
+        )
+    except ValueError as e:
+        missing = True
+        print("auto_eval without gt/pred rejected:", e)
+    assert missing, "auto_eval=True without gt_field/pred_field must raise"
+    assert not dataset.has_training_run("needs_fields")
+
+
+def s14_auto_eval_inference():
+    """auto_eval=None inference: defaults True iff a test_view is present and
+    no eval_key is being linked; False otherwise."""
+    need("fo", "dataset")
+    dataset = S["dataset"]
+    # (a) test_view present, no eval_key, auto_eval unspecified -> eval runs
+    with dataset.init_training_run(
+        train_key="infer_eval",
+        train_view=dataset.match_tags("train"),
+        test_view=dataset.match_tags("test"),
+        gt_field="ground_truth", pred_field="predictions",
+    ) as run:
+        pass
+    print("infer_eval   : auto_eval=%r eval_key=%r" % (
+        run.auto_eval, run.eval_key))
+    assert run.auto_eval is True, (
+        "test_view + no eval_key should infer auto_eval=True"
+    )
+    assert run.eval_key == "infer_eval", (
+        "inferred auto-eval should run and default eval_key to train_key"
+    )
+    # (b) no test_view -> no eval inferred
+    with dataset.init_training_run(
+        train_key="infer_noeval",
+        train_view=dataset.match_tags("train"),
+        gt_field="ground_truth", pred_field="predictions",
+    ) as run2:
+        pass
+    print("infer_noeval : auto_eval=%r eval_key=%r" % (
+        run2.auto_eval, run2.eval_key))
+    assert run2.auto_eval is False, "no test_view should infer auto_eval=False"
+    assert run2.eval_key is None, "no auto-eval should leave eval_key unset"
+
+
+def s15_plugin_operators():
+    """Best-effort: confirm the Training Runs PLUGIN (panel + operators) is
+    registered with FiftyOne -- not just the engine on the branch.
+
+    SKIPs (does not fail) when the plugin isn't installed yet, since the
+    validator is meant to run right after the branch install. Install the
+    plugin per the README, then re-run to validate the App surface too."""
+    try:
+        import fiftyone.operators as foo
+    except Exception as e:
+        raise SkipStep("fiftyone.operators unavailable: %s" % e)
+
+    plugin = "@voxel51/training-runs"
+    operators = [
+        "log_training_run", "edit_training_run", "evaluate_training_run",
+        "train_model", "open_training_runs_panel",
+    ]
+    found = {}
+    for op_name in operators + ["training_runs"]:  # last entry is the panel
+        uri = "%s/%s" % (plugin, op_name)
+        exists = foo.operator_exists(uri, enabled="all")
+        found[op_name] = exists
+        kind = "panel" if op_name == "training_runs" else "operator"
+        print("  %-8s %-44s %s" % (
+            kind, uri, "registered" if exists else "MISSING"))
+
+    if not any(found.values()):
+        raise SkipStep(
+            "no '%s' operators registered -- install the plugin (see "
+            "README) and re-run to validate the App surface" % plugin
+        )
+    missing = [k for k, ok in found.items() if not ok]
+    assert not missing, "plugin registered but missing: %s" % missing
+
+
 # =========================================================================
 def main():
     fh = open(REPORT, "w")
@@ -562,6 +648,9 @@ def main():
         step("10", "4.4  rename + delete (teardown)", s10_teardown)
         step("11", "4.2  door-3: link existing eval (no gt/pred, no exec)", s11_door3_link_existing_eval)
         step("12", "4.2  weld policy (idempotent / refuse / overwrite)", s12_weld_policy)
+        step("13", "4.2  key policy + input validation (no slugging)", s13_key_policy)
+        step("14", "4.2  auto_eval=None inference (both directions)", s14_auto_eval_inference)
+        step("15", "plugin operators + panel registered (App surface)", s15_plugin_operators)
 
         # final dataset cleanup
         try:
@@ -582,17 +671,23 @@ def main():
             print("  [%2s] %-6s %s" % (num, st, name))
         print("-" * 40)
         print("  PASS=%d  FAIL=%d  SKIP=%d" % (npass, nfail, nskip))
-        if nfail or nskip:
-            print("\n  -> Failures/skips above are the first task list. For each FAIL,")
-            print("     read the traceback and check the call against fiftyone/core/training.py")
-            print("     and collections.py. SKIP usually means an earlier step it depended on failed.")
-        else:
-            print("\n  -> All green. Branch delivers Piece 1 (4.2 + 4.4).")
+        if nfail:
+            print("\n  -> Each FAIL above is a task. Read the traceback and check the")
+            print("     call against fiftyone/core/training.py and dataset.py.")
+            print("     A FAIL means you are likely NOT on exp-model-train-log.")
+        if nskip:
+            print("\n  -> SKIP usually means a prerequisite step failed, OR (step 15)")
+            print("     the plugin isn't installed yet -- that step is best-effort and")
+            print("     does not gate the engine. Install the plugin per the README to")
+            print("     light it up.")
+        if not nfail:
+            print("\n  -> Engine green: the branch delivers Piece 1 (4.2 + 4.4) and the")
+            print("     SDK contracts. If step 15 passed too, the App plugin is wired.")
     finally:
         sys.stdout, sys.stderr = orig_out, orig_err
         fh.close()
     print("\nWrote report to: %s" % os.path.abspath(REPORT))
-    print("Send that file back.")
+    print("Open the App and inspect the panel.")
 
 if __name__ == "__main__":
     main()
