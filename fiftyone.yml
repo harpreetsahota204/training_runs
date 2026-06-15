@@ -18,3 +18,6 @@ operators:
   - open_training_runs_panel
 panels:
   - training_runs
+secrets:
+  # Only read when the Train Model door's "Push to HuggingFace Hub" is enabled.
+  - HF_TOKEN

@@ -6,9 +6,10 @@ The App-facing window onto training-run lineage. Three ways in:
   - SDK / notebook:  dataset.add_training_run(train_key, train_view, ...)
   - App, log:        Log / Edit Training Run forms associate views, a checkpoint
                      URI, a tracker URL, and an eval run that already exist.
-  - App, train:      The Train Model door fine-tunes an Ultralytics YOLO model
-                     and records the result through the engine surface
-                     (``init_training_run`` -> ``apply_model`` -> ``finish``).
+  - App, train:      The Train Model door fine-tunes an Ultralytics YOLO or
+                     HuggingFace model and records the result through the engine
+                     surface (``init_training_run`` -> ``apply_model`` ->
+                     ``finish``).
 
 Everything is fronted by the Training Runs panel (a React/JS panel; the
 operators below feed it data and perform its actions). All persistence is the
@@ -24,9 +25,17 @@ import sys as _sys
 # operators.py/panel.py and then reloading the App raises ImportError for any
 # newly added names (the cached submodule is stale). Reload submodules in
 # dependency order so edits are picked up without a full server restart.
-# `train` reloads after `operators` (it imports helpers from it) and before
+# `training_helpers` reloads first (the train cores import it), then the
+# family cores, then `train` (the operator that dispatches to them), then
 # `panel` (which prompts the train operator by URI).
-for _sub in ("operators", "train", "panel"):
+for _sub in (
+    "operators",
+    "training_helpers",
+    "train_yolo",
+    "train_hf",
+    "train",
+    "panel",
+):
     _mod = _sys.modules.get(f"{__name__}.{_sub}")
     if _mod is not None:
         _importlib.reload(_mod)

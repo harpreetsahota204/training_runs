@@ -1,0 +1,7 @@
+# The Train Model door fine-tunes YOLO models via Ultralytics...
+ultralytics
+# ...and HuggingFace AutoModels via transformers (timm/accelerate are needed
+# by many vision backbones and the Trainer).
+transformers
+timm
+accelerate

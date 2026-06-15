@@ -62,6 +62,9 @@ interface Row {
   train_config?: Record<string, any> | null;
   note?: string;
   splits?: Partial<Record<Split, SplitInfo>>;
+  // A queued/scheduled/running delegated op with no run record yet: rendered
+  // read-only until execute() registers the run.
+  pending?: boolean;
 }
 
 interface Props {
@@ -109,6 +112,8 @@ const EXEC_STATUS_LABEL: Record<string, string> = {
   completed: "Completed",
   failed: "Failed",
 };
+// Exec states that mean a run is still in flight (drives panel auto-refresh).
+const ACTIVE_EXEC_STATES = ["declared", "scheduled", "queued", "running", "in_progress"];
 const ORANGE = "#FF6D04";
 
 const InfoTable = styled(Table)(({ theme }) => ({
@@ -641,6 +646,7 @@ export default function TrainingRunsView({ data, schema }: Props) {
   );
 
   const refresh = () => call("refresh", view.refresh);
+  const poll = () => call("poll", view.poll);
   const openLog = () => call("open_log", view.open_log);
   const openTrain = () => call("open_train", view.open_train);
   const openEdit = (trainKey: string) =>
@@ -794,6 +800,17 @@ export default function TrainingRunsView({ data, schema }: Props) {
   // it matches the run currently open.
   const currentEvalSummary =
     selected && evalSummary?.train_key === selected ? evalSummary : undefined;
+
+  // Auto-refresh while a run is in flight so the exec-status pill flips from
+  // Running -> Completed/Failed without a manual refresh. Poll silently (no
+  // toast) and stop once nothing is active.
+  const hasActive = rows.some((r) => ACTIVE_EXEC_STATES.includes(r.exec_status || ""));
+  useEffect(() => {
+    if (!hasActive) return;
+    const id = setInterval(poll, 4000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasActive]);
 
   // ---- detail view -------------------------------------------------------
   if (selected && current) {
@@ -1025,6 +1042,33 @@ export default function TrainingRunsView({ data, schema }: Props) {
         </Typography>
       ) : (
         rows.map((r) => {
+          // A pending row has no run record yet (delegated op queued/scheduled/
+          // running): show it read-only so the launch is visible immediately.
+          if (r.pending) {
+            return (
+              <Card key={r.train_key} variant="outlined" sx={{ p: 2, opacity: 0.85 }}>
+                <Stack
+                  direction="row"
+                  sx={{ justifyContent: "space-between", alignItems: "center" }}
+                >
+                  <Stack direction="row" spacing={0.75} sx={{ alignItems: "center" }}>
+                    <RunIcon sx={{ color: ORANGE }} fontSize="small" />
+                    <Typography sx={{ fontSize: 16, fontWeight: 600 }}>
+                      {r.train_key}
+                    </Typography>
+                  </Stack>
+                  <ExecStatusPill status={r.exec_status} />
+                </Stack>
+                <Typography
+                  variant="caption"
+                  color="secondary"
+                  sx={{ mt: 1, display: "block" }}
+                >
+                  Waiting for a delegated worker to start this run…
+                </Typography>
+              </Card>
+            );
+          }
           const present = SPLITS.filter((s) => r.splits?.[s]?.present);
           const status = r.status || "new";
           return (

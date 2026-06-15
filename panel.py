@@ -9,15 +9,110 @@ Edit/Evaluate forms succeed, ``on_success`` re-pushes the rows so the panel
 refreshes itself.
 """
 
+from datetime import datetime
+
 import fiftyone.operators as foo
+import fiftyone.operators.delegated as food
 import fiftyone.operators.types as types
 import fiftyone.utils.training as fout
+from fiftyone.operators.executor import ExecutionRunState
 
 _PLUGIN = "@voxel51/training-runs"
 _EVAL_PANEL = "model_evaluation_panel_builtin"
+_TRAIN_OP = f"{_PLUGIN}/train_model"
 
 # The three splits, in display order.
 SPLITS = ("train", "val", "test")
+
+# Delegated run-states that mean a run is still pending/in-flight: the panel
+# surfaces these (and keeps polling) even before the run's record exists, since
+# a delegated run isn't registered until its execute() runs on a worker.
+_ACTIVE_DO_STATES = (
+    ExecutionRunState.SCHEDULED,
+    ExecutionRunState.QUEUED,
+    ExecutionRunState.RUNNING,
+)
+
+
+def _op_time(op):
+    """A sortable timestamp for an op (latest lifecycle stamp wins)."""
+    return (
+        op.updated_at
+        or op.completed_at
+        or op.failed_at
+        or op.started_at
+        or op.scheduled_at
+        or op.queued_at
+        or datetime.min
+    )
+
+
+def _delegated_ops(dataset):
+    """Map of ``train_key`` -> newest ``train_model`` delegated op for this
+    dataset.
+
+    Lets the panel reflect the delegated lifecycle (scheduled/queued/running)
+    and surface a queued run *before* its record is created at execute time.
+    Best-effort: returns ``{}`` if the delegated store can't be queried.
+    """
+    try:
+        ops = food.DelegatedOperationService().list_operations(
+            operator=_TRAIN_OP, dataset_id=dataset._doc.id
+        )
+    except Exception:
+        return {}
+
+    out = {}
+    for op in ops:
+        params = (op.context.params if op.context else None) or {}
+        train_key = params.get("train_key")
+        if not train_key:
+            continue
+        current = out.get(train_key)
+        if current is None or _op_time(op) >= _op_time(current):
+            out[train_key] = op
+    return out
+
+
+def _exec_status(record_status, op):
+    """The displayed execution status: one of SCHEDULED|QUEUED|RUNNING|
+    COMPLETED|FAILED (or "declared").
+
+    A terminal record status (completed/failed) is authoritative. Otherwise the
+    live delegated state (scheduled/queued/running) is preferred, falling back
+    to the record's ``in_progress`` -> ``running``.
+    """
+    if record_status in ("completed", "failed"):
+        return record_status
+    do_state = op.run_state if op is not None else None
+    if do_state in _ACTIVE_DO_STATES:
+        return do_state
+    if record_status == "in_progress":
+        return ExecutionRunState.RUNNING
+    return record_status or "declared"
+
+
+def _pending_row(train_key, op):
+    """A placeholder row for a scheduled/queued/running delegated op whose run
+    record doesn't exist yet (it's created when execute() runs on a worker)."""
+    queued_at = _op_time(op)
+    return {
+        "train_key": train_key,
+        "checkpoint_uri": None,
+        "project_url": None,
+        "eval_key": None,
+        "eval_type": None,
+        "eval_method": None,
+        "label_field": None,
+        "created_at": queued_at.isoformat() if queued_at else None,
+        "status": "new",
+        "exec_status": op.run_state,
+        "train_config": None,
+        "note": "",
+        "splits": {},
+        # No run record backs this row yet; the panel renders it read-only.
+        "pending": True,
+    }
 
 
 def _split_info(config, split):
@@ -47,7 +142,7 @@ def _eval_meta(dataset, eval_key):
     return getattr(config, "type", None), getattr(config, "method", None)
 
 
-def _run_row(dataset, key, info):
+def _run_row(dataset, key, info, op=None):
     """Adapts a :class:`TrainingInfo` into the ``Row`` shape the React panel
     consumes. The single seam between the run framework and the panel: every
     other handler maps 1:1 to an SDK call.
@@ -56,6 +151,7 @@ def _run_row(dataset, key, info):
         dataset: the :class:`fiftyone.core.dataset.Dataset`
         key: the ``train_key``
         info: the :class:`fiftyone.core.training.TrainingInfo`
+        op (None): the run's delegated op, if any (drives ``exec_status``)
 
     Returns:
         a JSON-safe ``Row`` dict
@@ -78,9 +174,11 @@ def _run_row(dataset, key, info):
         "created_at": timestamp.isoformat() if timestamp else None,
         # review pill, NOT execution status (config.status)
         "status": c.review_status or "new",
-        # execution lifecycle: declared/in_progress/completed/failed (+ the
-        # scheduled/queued states the delegated path will add later)
-        "exec_status": c.status or "declared",
+        # execution lifecycle, reconciled with the delegated op so the pill can
+        # show scheduled/queued/running before the run record turns terminal
+        "exec_status": _exec_status(c.status, op),
+        # a real run record backs this row (vs a queued-but-unstarted op)
+        "pending": False,
         # opaque per-run training params / script (rendered read-only)
         "train_config": c.train_config or None,
         "note": c.note or "",
@@ -122,13 +220,29 @@ def _num(v):
 
 
 def _runs_rows(ctx):
-    """All training runs as ``Row`` dicts, newest first, read from the run
-    framework via the ``_run_row`` adapter."""
+    """All training runs as ``Row`` dicts, newest first.
+
+    Merges two sources: the run records (``list_training_runs``) and the
+    in-flight ``train_model`` delegated ops. An active op (scheduled/queued/
+    running) with no record yet is surfaced as a read-only "pending" row, so a
+    just-launched delegated run shows up immediately instead of after a worker
+    registers it. Terminal ops without a record are ignored (the run was
+    deleted, or failed before registering).
+    """
     dataset = ctx.dataset
-    rows = [
-        _run_row(dataset, k, dataset.get_training_info(k))
-        for k in dataset.list_training_runs()
-    ]
+    ops = _delegated_ops(dataset)
+
+    rows = []
+    seen = set()
+    for k in dataset.list_training_runs():
+        info = dataset.get_training_info(k)
+        rows.append(_run_row(dataset, k, info, ops.get(k)))
+        seen.add(k)
+
+    for train_key, op in ops.items():
+        if train_key not in seen and op.run_state in _ACTIVE_DO_STATES:
+            rows.append(_pending_row(train_key, op))
+
     rows.sort(key=lambda x: (x.get("created_at") or ""), reverse=True)
     return rows
 
@@ -164,6 +278,12 @@ class TrainingRunsPanel(foo.Panel):
             f"Refreshed — {n} training run{'' if n == 1 else 's'}",
             variant="success",
         )
+
+    def poll(self, ctx):
+        """Silent re-push (no toast) -- the React side calls this on a timer
+        while a run is in-flight, so the exec-status pill flips from Running to
+        Completed/Failed without the user hitting Refresh."""
+        self._push(ctx)
 
     # --- form launchers (auto-refresh via on_success) ----------------------
     def _prompt_run_form(self, ctx, operator):
@@ -356,6 +476,7 @@ class TrainingRunsPanel(foo.Panel):
                 component="TrainingRunsView",
                 composite_view=True,
                 refresh=self.refresh,
+                poll=self.poll,
                 open_log=self.open_log,
                 open_train=self.open_train,
                 open_edit=self.open_edit,

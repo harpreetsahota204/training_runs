@@ -1,99 +1,149 @@
-"""The "Train model" door: fine-tune an Ultralytics YOLO model on the run's
-views and record the result through the engine surface only.
+"""The "Train model" door: fine-tune a model on the run's views and record the
+result through the engine surface only.
 
-Greenfield Piece 3. The operator exports the chosen train/val views, fine-tunes
-a YOLO model, then funnels everything through
-``init_training_run`` -> ``apply_model`` -> ``finish`` so the produced record is
-indistinguishable from a notebook (door-1) run. The trainer never writes run
-storage, config, or status directly -- the engine owns the record.
+The form is task-first: pick what you want to train (detection, classification,
+segmentation, pose) -- only tasks some label field can actually drive are
+offered -- then the label field choices are filtered to the fields whose type +
+contents support that task (segmentation needs a semantic ``Segmentation``
+field, a ``Detections`` field with instance masks, or a filled ``Polylines``
+field; etc.). The framework choices -- Ultralytics YOLO or a HuggingFace
+AutoModel -- are then filtered to those that can train that task + label type
+(e.g. pose is YOLO-only, HF segmentation needs semantic masks), so the user
+can't pick an incompatible combination. The trained model is funnelled through
+``init_training_run`` -> ``apply_model`` -> ``finish`` (in
+``training_helpers.record_run``) so the produced record is indistinguishable
+from a notebook (door-1) run; the engine owns the record.
 
-Only the export/train/apply internals are YOLO-specific; the view resolution,
-checkpoint placement, and engine calls are family-agnostic so a future
-HuggingFace door can reuse them.
+The family-specific export/fit/apply work lives in ``train_yolo`` and
+``train_hf``; the form scaffolding and engine flow are shared via
+``training_helpers``.
 """
 
-import importlib.util
-import os
-
-import fiftyone as fo
 import fiftyone.core.labels as fol
-import fiftyone.core.storage as fos
 import fiftyone.operators as foo
 import fiftyone.operators.types as types
-import fiftyone.utils.training as fout
 
-from .operators import (
-    _CURRENT,
-    _dropdown,
-    _resolve_view_arg,
-    _split_target_input,
-    _view_dropdown,
-)
+from . import train_hf, train_yolo
+from . import training_helpers as th
+from .operators import _dropdown, _valid_identifier
 
-# ultralytics is an optional dependency; check without importing the heavy
-# package at plugin-load time (the real import happens in _train).
-_HAS_ULTRALYTICS = importlib.util.find_spec("ultralytics") is not None
-
-# YOLO checkpoints offered per task (nano -> xlarge).
-YOLO_MODELS = {
-    "detection": ["yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolov8n.pt", "yolov8s.pt"],
-    "classification": ["yolo11n-cls.pt", "yolo11s-cls.pt", "yolov8n-cls.pt"],
-    "segmentation": ["yolo11n-seg.pt", "yolo11s-seg.pt", "yolov8n-seg.pt"],
-    "pose": ["yolo11n-pose.pt", "yolo11s-pose.pt", "yolov8n-pose.pt"],
+_FRAMEWORK_LABELS = {
+    "ultralytics": "Ultralytics YOLO",
+    "huggingface": "HuggingFace AutoModel",
 }
 
-# The engine's evaluation cleanly scores detection/classification; pose and
-# instance-segmentation are recorded without auto-eval in v1.
-_AUTO_EVAL_TASKS = ("detection", "classification")
+# Tasks offered, in display order. A task is shown only when some label field
+# can actually drive it (see ``_available_tasks``).
+_TASKS = ("detection", "classification", "segmentation", "pose")
 
-# Ground-truth label types accepted per task.
-_TASK_LABEL_TYPES = {
-    "detection": (fol.Detections,),
-    "classification": (fol.Classification,),
-    "segmentation": (fol.Detections, fol.Polylines),
-    "pose": (fol.Keypoints,),
+# Field suffix to count distinct classes on, per label type (for the notice
+# shown after the label field is picked).
+_COUNT_PATHS = {
+    fol.Detections: "detections.label",
+    fol.Polylines: "polylines.label",
+    fol.Keypoints: "keypoints.label",
+    fol.Classification: "label",
 }
 
-# Where to read class names from, per task (first non-empty path wins).
-_CLASS_PATHS = {
-    "detection": ["{f}.detections.label"],
-    "segmentation": ["{f}.detections.label", "{f}.polylines.label"],
-    "pose": ["{f}.keypoints.label"],
-    "classification": ["{f}.label"],
-}
 
-_OPTIMIZERS = ["auto", "SGD", "Adam", "AdamW", "RMSProp"]
+def _has_instance_masks(ctx, field):
+    """True if any detection in ``field`` carries an instance mask (in-memory
+    ``mask`` or on-disk ``mask_path``) -- the prerequisite for segmentation."""
+    n = ctx.dataset.count(f"{field}.detections.mask")
+    n += ctx.dataset.count(f"{field}.detections.mask_path")
+    return n > 0
 
 
-def _task_label_fields(ctx, task):
-    """Top-level label fields whose type matches ``task``."""
-    accepted = _TASK_LABEL_TYPES[task]
+def _has_filled_polylines(ctx, field):
+    """True if any polyline in ``field`` is filled (a polygon/region rather
+    than an open curve) -- the prerequisite for segmentation."""
+    return ctx.dataset.count_values(f"{field}.polylines.filled").get(True, 0) > 0
+
+
+def _task_label_types(task):
+    """The label types that can drive ``task`` across either framework (the
+    union of the YOLO and HF tables -- the single source of truth for which
+    field types a task accepts)."""
+    out = set(train_yolo.TASK_LABEL_TYPES.get(task, ()))
+    out.update(train_hf.TASK_LABEL_TYPES.get(task, ()))
+    return tuple(out)
+
+
+def _fields_for_task(ctx, task):
+    """Label fields whose type AND contents can drive ``task``.
+
+    Type alone settles every task except segmentation, where a ``Detections``
+    field qualifies only with instance masks and a ``Polylines`` field only
+    when filled (a semantic ``Segmentation`` field always qualifies).
+    """
+    fields = th.label_fields_for(ctx, _task_label_types(task))
+    if task != "segmentation":
+        return fields
+
     out = []
-    for name, field in ctx.dataset.get_field_schema().items():
-        doc_type = getattr(field, "document_type", None)
-        if isinstance(doc_type, type) and issubclass(doc_type, accepted):
+    for name in fields:
+        label_type = th.label_type(ctx, name)
+        if label_type is fol.Segmentation:
+            out.append(name)
+        elif label_type is fol.Detections and _has_instance_masks(ctx, name):
+            out.append(name)
+        elif label_type is fol.Polylines and _has_filled_polylines(ctx, name):
             out.append(name)
     return out
 
 
-def _classes(view, task, label_field):
-    """Sorted, non-null class names for the run's label field."""
-    for template in _CLASS_PATHS[task]:
-        values = [v for v in view.distinct(template.format(f=label_field)) if v is not None]
-        if values:
-            return sorted(values)
-    return []
+def _available_tasks(ctx):
+    """Tasks (in display order) that at least one label field can drive."""
+    return [task for task in _TASKS if _fields_for_task(ctx, task)]
+
+
+def _valid_frameworks(ctx, task, label_field):
+    """Installed frameworks that can train ``task`` on ``label_field``'s type.
+
+    This is the upfront validation seam: only compatible, installed frameworks
+    are offered, so the user can't launch a run that would fail at fit time
+    (e.g. HF segmentation on a ``Detections`` field, or pose on HF)."""
+    label_type = th.label_type(ctx, label_field)
+    if label_type is None:
+        return []
+
+    out = []
+    yolo_types = train_yolo.TASK_LABEL_TYPES.get(task)
+    if train_yolo.HAS_ULTRALYTICS and yolo_types and issubclass(label_type, yolo_types):
+        out.append("ultralytics")
+    hf_types = train_hf.TASK_LABEL_TYPES.get(task)
+    if train_hf.HAS_TRANSFORMERS and hf_types and issubclass(label_type, hf_types):
+        out.append("huggingface")
+    return out
+
+
+def _class_notice(ctx, inputs, label_field):
+    """Show how many classes the chosen label field has (best-effort)."""
+    label_type = th.label_type(ctx, label_field)
+    suffix = _COUNT_PATHS.get(label_type)
+    if suffix is not None:
+        n = sum(1 for v in ctx.dataset.distinct(f"{label_field}.{suffix}") if v)
+        label = f"Found {n} classes in '{label_field}'"
+    elif label_type is fol.Segmentation:
+        targets = (ctx.dataset.mask_targets or {}).get(label_field) or ctx.dataset.default_mask_targets
+        if not targets:
+            return
+        label = f"{len(targets)} mask classes in '{label_field}'"
+    else:
+        return
+
+    inputs.view("classes", types.Notice(label=label))
 
 
 class TrainModel(foo.Operator):
-    """Fine-tune a YOLO model and record its lineage through the engine."""
+    """Fine-tune a YOLO or HuggingFace model and record its lineage."""
 
     @property
     def config(self):
         return foo.OperatorConfig(
             name="train_model",
             label="Train Model",
-            description="Fine-tune a YOLO model on your views and record its lineage",
+            description="Fine-tune a model on your views and record its lineage",
             icon="fitness_center",
             dynamic=True,
             # Let the user choose immediate vs delegated (background); training
@@ -106,47 +156,39 @@ class TrainModel(foo.Operator):
     def resolve_input(self, ctx):
         inputs = types.Object()
 
-        if not _HAS_ULTRALYTICS:
+        th.add_train_key(inputs)
+
+        # 1) Task -- only those some label field can actually drive.
+        tasks = _available_tasks(ctx)
+        if not tasks:
             inputs.view(
-                "error",
-                types.Error(
-                    label="Ultralytics not installed",
-                    description="Install it with: pip install ultralytics",
+                "no_fields",
+                types.Warning(
+                    label="No trainable label fields found",
+                    description=(
+                        "Need a Detections, Classification, Keypoints, "
+                        "Segmentation, or filled Polylines field"
+                    ),
                 ),
             )
-            return types.Property(inputs, view=types.View(label="Train Model"))
-
-        inputs.str(
-            "train_key",
-            required=True,
-            label="Training run name",
-            description="A valid identifier (letters, digits, underscores)",
-        )
-
+            return th.page(inputs)
         task_view = types.RadioGroup()
-        for t in YOLO_MODELS:
+        for t in tasks:
             task_view.add_choice(t, label=t.capitalize())
         inputs.enum(
             "task",
-            list(YOLO_MODELS),
-            default="detection",
+            tasks,
+            default=tasks[0],
             required=True,
             view=task_view,
             label="Task",
         )
-        task = ctx.params.get("task", "detection")
+        task = ctx.params.get("task")
+        if task not in tasks:
+            task = tasks[0]
 
-        fields = _task_label_fields(ctx, task)
-        if not fields:
-            inputs.view(
-                "no_fields",
-                types.Warning(
-                    label=f"No {task} label fields found",
-                    description=f"This dataset has no field of the type {task} needs",
-                ),
-            )
-            return types.Property(inputs, view=types.View(label="Train Model"))
-
+        # 2) Label field -- those whose type + contents can drive this task.
+        fields = _fields_for_task(ctx, task)
         inputs.enum(
             "label_field",
             fields,
@@ -156,183 +198,72 @@ class TrainModel(foo.Operator):
             description="The ground-truth field to train on",
         )
         label_field = ctx.params.get("label_field")
-        if not label_field:
-            return types.Property(inputs, view=types.View(label="Train Model"))
+        if label_field not in fields:
+            return th.page(inputs)
+        _class_notice(ctx, inputs, label_field)
 
-        classes = _classes(ctx.dataset, task, label_field)
-        inputs.view(
-            "classes",
-            types.Notice(label=f"Found {len(classes)} classes in '{label_field}'"),
-        )
+        # 3) Training data (train/val/test).
+        th.add_splits(inputs, ctx)
 
-        models = YOLO_MODELS[task]
+        # 4) Framework -- only those that can train this task + label type.
+        frameworks = _valid_frameworks(ctx, task, label_field)
+        if not frameworks:
+            inputs.view(
+                "no_framework",
+                types.Error(
+                    label="No compatible training framework",
+                    description=(
+                        "No installed framework can train this task on the "
+                        f"'{label_field}' field type"
+                    ),
+                ),
+            )
+            return th.page(inputs)
+        framework_view = types.RadioGroup()
+        for value in frameworks:
+            framework_view.add_choice(value, label=_FRAMEWORK_LABELS[value])
         inputs.enum(
-            "model_name",
-            models,
-            default=models[0],
+            "framework",
+            frameworks,
+            default=frameworks[0],
             required=True,
-            view=_dropdown(models),
-            label="YOLO model",
+            view=framework_view,
+            label="Framework",
         )
+        framework = ctx.params.get("framework")
+        if framework not in frameworks:
+            framework = frameworks[0]
 
-        # Train / val / test views (train required; val/test optional).
-        values, view = _view_dropdown(ctx)
-        inputs.enum(
-            "train_target",
-            values,
-            default=_CURRENT,
-            view=view,
-            label="Training data",
-            description="The view to fine-tune on",
-        )
-        _split_target_input(
-            inputs, ctx, "val_target", "Validation data (optional)",
-            "Used for validation during training",
-        )
-        _split_target_input(
-            inputs, ctx, "test_target", "Test data (optional)",
-            "Held out for the post-training evaluation",
-        )
+        # 5) Model + hyperparameters (framework-specific).
+        if framework == "huggingface":
+            ready = train_hf.hf_model_inputs(inputs, ctx, task)
+            pred_default = "hf_predictions"
+        else:
+            ready = train_yolo.yolo_model_inputs(inputs, ctx, task)
+            pred_default = "yolo_predictions"
+        if not ready:
+            return th.page(inputs)
 
-        inputs.str(
-            "pred_field",
-            default="yolo_predictions",
-            required=True,
-            label="Predictions field",
-            description="Where the trained model's predictions are written",
-        )
-
-        inputs.int("epochs", default=10, label="Epochs")
-        inputs.int("imgsz", default=640, label="Image size")
-        inputs.int("batch_size", default=16, label="Batch size")
-        inputs.float("learning_rate", default=0.01, label="Learning rate")
-        inputs.enum(
-            "optimizer",
-            _OPTIMIZERS,
-            default="auto",
-            view=_dropdown(_OPTIMIZERS),
-            label="Optimizer",
-        )
-        inputs.int("patience", default=50, label="Early-stopping patience")
-        inputs.float(
-            "confidence",
-            default=0.25,
-            label="Confidence threshold",
-            description="Minimum confidence for the predictions written back",
-        )
-
-        inputs.file(
-            "output_parent_dir",
-            required=True,
-            label="Output parent directory",
-            description="Local or cloud directory to store the checkpoint",
-            view=types.FileExplorerView(choose_dir=True, button_label="Choose a directory..."),
-        )
-        inputs.str(
-            "model_dir_name",
-            default=ctx.params.get("train_key") or "finetuned_model",
-            required=True,
-            label="Model folder name",
-        )
-
-        inputs.str(
-            "project_url",
-            label="Experiment / tracker URL",
-            description="Link to W&B / MLflow / a ticket (optional)",
-        )
-
-        return types.Property(inputs, view=types.View(label="Train Model"))
+        # 6) Predictions field, checkpoint output, experiment tracker.
+        th.add_pred_field(inputs, pred_default)
+        th.add_output(inputs, ctx)
+        th.add_project_url(inputs)
+        return th.page(inputs)
 
     def execute(self, ctx):
         train_key = ctx.params["train_key"]
-        if not train_key.isidentifier():
-            ctx.ops.notify(
-                f"'{train_key}' is not a valid name: use letters, digits and "
-                "underscores, and don't start with a digit.",
-                variant="error",
-            )
+        if not _valid_identifier(ctx, train_key):
             return
 
-        # The delegated executor wraps execute() in an asyncio Future, which
-        # cannot carry a StopIteration -- one can leak from the trainer's
-        # internal DataLoader iteration, so translate it to a real error.
-        try:
-            return self._train(ctx, train_key)
-        except StopIteration as e:
-            raise RuntimeError(
-                "Training iteration ended unexpectedly (StopIteration crossed "
-                "the delegated-execution boundary)."
-            ) from e
-
-    def _train(self, ctx, train_key):
-        from ultralytics import YOLO
-
-        task = ctx.params.get("task", "detection")
-        label_field = ctx.params["label_field"]
-        pred_field = ctx.params.get("pred_field") or "yolo_predictions"
-        model_name = ctx.params["model_name"]
-
-        # The args (a saved-view name, current view, or dataset) are passed to
-        # the engine as-is so it records the name breadcrumb; the export needs
-        # the resolved view objects.
-        train_arg = _resolve_view_arg(ctx, ctx.params["train_target"])
-        val_arg = _resolve_view_arg(ctx, ctx.params.get("val_target"))
-        test_arg = _resolve_view_arg(ctx, ctx.params.get("test_target"))
-        train_view = fout.resolve_view(ctx.dataset, train_arg)
-        val_view = fout.resolve_view(ctx.dataset, val_arg)
-
-        hyperparams = {
-            "epochs": ctx.params.get("epochs", 10),
-            "imgsz": ctx.params.get("imgsz", 640),
-            "batch": ctx.params.get("batch_size", 16),
-            "lr0": ctx.params.get("learning_rate", 0.01),
-            "optimizer": ctx.params.get("optimizer", "auto"),
-            "patience": ctx.params.get("patience", 50),
-        }
-
-        export_dir = fos.make_temp_dir()
-        data_path = _export(train_view, val_view, task, label_field, export_dir)
-
-        model = YOLO(model_name)
-        model.train(
-            data=data_path,
-            project=os.path.join(export_dir, "runs"),
-            name="train",
-            exist_ok=True,
-            **hyperparams,
+        # Building the spec is cheap (resolves splits + config); the heavy fit
+        # runs inside record_run's run block. Guard the whole thing so a
+        # StopIteration leaking from the HF Trainer can't poison the async loop.
+        framework = ctx.params.get("framework", "ultralytics")
+        core = train_hf.train_hf if framework == "huggingface" else train_yolo.train_yolo
+        spec = core(ctx, train_key)
+        return th.guard_stop_iteration(
+            lambda: th.record_run(ctx, train_key, **spec)
         )
-        checkpoint_uri = _place_checkpoint(ctx, str(model.trainer.best))
-
-        train_config = {"model": model_name, "task": task, **hyperparams}
-        if ctx.user_id:
-            train_config["triggered_by"] = ctx.user_id
-
-        run = ctx.dataset.init_training_run(
-            train_key,
-            train_arg,
-            val_view=val_arg,
-            test_view=test_arg,
-            gt_field=label_field,
-            pred_field=pred_field,
-            auto_eval=None if task in _AUTO_EVAL_TASKS else False,
-            project_url=ctx.params.get("project_url") or None,
-            train_config=train_config,
-        )
-        # `with run` marks the record failed (with traceback) on any error.
-        with run:
-            model.conf = ctx.params.get("confidence", 0.25)
-            samples = run.test_view or run.val_view or run.train_view
-            run.apply_model(model, samples=samples)
-            run.finish(checkpoint_uri=checkpoint_uri)
-
-        ctx.ops.notify(f"Trained model '{train_key}'", variant="success")
-        return {
-            "train_key": train_key,
-            "task": task,
-            "model_name": model_name,
-            "checkpoint_uri": checkpoint_uri,
-            "eval_key": run.eval_key,
-        }
 
     def resolve_output(self, ctx):
         outputs = types.Object()
@@ -354,60 +285,3 @@ class TrainModel(foo.Operator):
             ),
         )
         return types.Property(outputs, view=types.View(label="Training Complete"))
-
-
-def _export(train_view, val_view, task, label_field, export_dir):
-    """Export the train (and val) views to the on-disk format YOLO trains on.
-
-    Returns the ``data`` argument for ``model.train`` -- a directory for
-    classification, a ``dataset.yaml`` otherwise.
-    """
-    if task == "classification":
-        train_view.export(
-            export_dir=os.path.join(export_dir, "train"),
-            dataset_type=fo.types.ImageClassificationDirectoryTree,
-            label_field=label_field,
-        )
-        if val_view is not None:
-            val_view.export(
-                export_dir=os.path.join(export_dir, "val"),
-                dataset_type=fo.types.ImageClassificationDirectoryTree,
-                label_field=label_field,
-            )
-        return export_dir
-
-    classes = _classes(train_view, task, label_field)
-    train_view.export(
-        export_dir=export_dir,
-        dataset_type=fo.types.YOLOv5Dataset,
-        label_field=label_field,
-        classes=classes,
-        split="train",
-    )
-    if val_view is not None:
-        val_view.export(
-            export_dir=export_dir,
-            dataset_type=fo.types.YOLOv5Dataset,
-            label_field=label_field,
-            classes=classes,
-            split="val",
-        )
-    return os.path.join(export_dir, "dataset.yaml")
-
-
-def _place_checkpoint(ctx, best_path):
-    """Copy the trained ``best.pt`` into the user's output directory (local or
-    cloud) and return its final URI."""
-    raw = ctx.params.get("output_parent_dir") or "."
-    parent = raw["absolute_path"] if isinstance(raw, dict) else raw
-    folder = ctx.params.get("model_dir_name") or "finetuned_model"
-
-    if fos.is_local(parent):
-        dest_dir = os.path.join(fos.normalize_path(parent), folder)
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, "best.pt")
-    else:
-        dest = "/".join([parent.rstrip("/"), folder, "best.pt"])
-
-    fos.copy_file(best_path, dest)
-    return dest

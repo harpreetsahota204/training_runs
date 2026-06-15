@@ -42,6 +42,23 @@ def _dropdown(values):
     return view
 
 
+def _valid_identifier(ctx, value, kind="name"):
+    """True iff ``value`` is a valid identifier; notifies the user if not.
+
+    The engine validates run / eval keys (a non-identifier raises ValueError);
+    we reject early with a readable message instead of a raw traceback. ``kind``
+    tailors the message (e.g. "name", "evaluation key").
+    """
+    if value.isidentifier():
+        return True
+    ctx.ops.notify(
+        f"'{value}' is not a valid {kind}: use letters, digits and "
+        "underscores, and don't start with a digit.",
+        variant="error",
+    )
+    return False
+
+
 def _view_dropdown(ctx, optional=False):
     """The view-target choices: the whole dataset, the current view, each saved
     view, and each sample tag. When ``optional``, a leading "(none)" choice lets
@@ -205,14 +222,7 @@ class LogTrainingRun(foo.Operator):
 
     def execute(self, ctx):
         train_key = ctx.params["train_key"]
-        # RD1: the engine requires a valid identifier; reject early with a
-        # readable message instead of a raw ValueError from register_run.
-        if not train_key.isidentifier():
-            ctx.ops.notify(
-                f"'{train_key}' is not a valid name: use letters, digits and "
-                "underscores, and don't start with a digit.",
-                variant="error",
-            )
+        if not _valid_identifier(ctx, train_key):
             return
 
         train_view = _resolve_view_arg(ctx, ctx.params["view_target"])
@@ -539,12 +549,7 @@ class EvaluateTrainingRun(foo.Operator):
             run.save_config()
 
         eval_key = ctx.params.get("eval_key") or train_key
-        if not eval_key.isidentifier():
-            ctx.ops.notify(
-                f"'{eval_key}' is not a valid evaluation key: use letters, "
-                "digits and underscores, and don't start with a digit.",
-                variant="error",
-            )
+        if not _valid_identifier(ctx, eval_key, "evaluation key"):
             return
         if eval_key in ctx.dataset.list_evaluations():
             ctx.ops.notify(
