@@ -4,8 +4,8 @@ The Training Runs panel.
 A Python ``Panel`` that owns the data + actions and delegates rendering to a
 React component (``TrainingRunsView``) via ``composite_view=True``. Panel
 methods are wired straight to the frontend -- no standalone operators -- and
-data is pushed to React through ``ctx.panel.set_data``. After the Log/Edit/
-Evaluate forms succeed, ``on_success`` re-pushes the rows so the panel
+data is pushed to React through ``ctx.panel.set_data``. After the Train/Log/
+Edit/Evaluate forms succeed, ``on_success`` re-pushes the rows so the panel
 refreshes itself.
 """
 
@@ -176,6 +176,9 @@ class TrainingRunsPanel(foo.Panel):
 
     def open_log(self, ctx):
         ctx.prompt(f"{_PLUGIN}/log_training_run", on_success=self.refresh)
+
+    def open_train(self, ctx):
+        ctx.prompt(f"{_PLUGIN}/train_model", on_success=self.refresh)
 
     def open_edit(self, ctx):
         self._prompt_run_form(ctx, "edit_training_run")
@@ -354,6 +357,7 @@ class TrainingRunsPanel(foo.Panel):
                 composite_view=True,
                 refresh=self.refresh,
                 open_log=self.open_log,
+                open_train=self.open_train,
                 open_edit=self.open_edit,
                 open_eval=self.open_eval,
                 open_evaluate=self.open_evaluate,

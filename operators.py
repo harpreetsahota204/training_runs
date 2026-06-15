@@ -18,6 +18,11 @@ _NONE = "__none__"
 _CURRENT = "__current__"
 _DATASET = "__dataset__"
 
+# Dropdown values are namespaced so a saved view and a sample tag with the same
+# name don't collide (and so we know which kind a choice is when resolving it).
+_VIEW_PREFIX = "view:"
+_TAG_PREFIX = "tag:"
+
 
 def _label_fields(ctx):
     """Top-level label fields on the dataset (e.g. detections / classifications)."""
@@ -38,17 +43,30 @@ def _dropdown(values):
 
 
 def _view_dropdown(ctx, optional=False):
-    """Saved views + the synthetic targets, as a dropdown. When ``optional``,
-    a leading "(none)" choice lets the user skip logging this split."""
+    """The view-target choices: the whole dataset, the current view, each saved
+    view, and each sample tag. When ``optional``, a leading "(none)" choice lets
+    the user skip this split."""
     view = types.DropdownView()
+    values = []
+
     if optional:
         view.add_choice(_NONE, label="(none)")
+        values.append(_NONE)
+
     view.add_choice(_CURRENT, label="Current view")
     view.add_choice(_DATASET, label="Entire dataset")
-    saved = ctx.dataset.list_saved_views()
-    for name in saved:
-        view.add_choice(name, label=name)
-    values = ([_NONE] if optional else []) + [_CURRENT, _DATASET, *saved]
+    values += [_CURRENT, _DATASET]
+
+    for name in ctx.dataset.list_saved_views():
+        value = _VIEW_PREFIX + name
+        view.add_choice(value, label=f"{name} (saved view)")
+        values.append(value)
+
+    for tag in ctx.dataset.distinct("tags"):
+        value = _TAG_PREFIX + tag
+        view.add_choice(value, label=f"{tag} (sample tag)")
+        values.append(value)
+
     return values, view
 
 
@@ -100,8 +118,8 @@ def _resolve_view_arg(ctx, target):
     """Maps a dropdown choice to a ``train_view`` arg for the engine.
 
     A saved-view choice is passed through as its **name** (a string) so the
-    engine captures the saved-view-name breadcrumb; the synthetic targets
-    resolve to view objects; "(none)" -> ``None``.
+    engine captures the saved-view-name breadcrumb; tags and the synthetic
+    targets resolve to view objects; "(none)" -> ``None``.
     """
     if target in (None, _NONE):
         return None
@@ -109,7 +127,11 @@ def _resolve_view_arg(ctx, target):
         return ctx.view
     if target == _DATASET:
         return ctx.dataset
-    return target  # a saved-view name; the engine resolves + records it
+    if target.startswith(_VIEW_PREFIX):
+        return target[len(_VIEW_PREFIX):]  # saved-view name; engine resolves it
+    if target.startswith(_TAG_PREFIX):
+        return ctx.dataset.match_tags(target[len(_TAG_PREFIX):])
+    return target  # bare saved-view name (backwards compatible)
 
 
 def _clear_eval_link(run):

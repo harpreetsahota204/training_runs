@@ -168,6 +168,10 @@ const BackIcon = makeIcon(
 );
 // "Add"
 const AddIcon = makeIcon("M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z");
+// "FitnessCenter" (dumbbell/barbell)
+const FitnessCenterIcon = makeIcon(
+  "M20.57 14.86 22 13.43 20.57 12 17 15.57 8.43 7 12 3.43 10.57 2 9.14 3.43 7.71 2 5.57 4.14 4.14 2.71 2.71 4.14l1.43 1.43L2 7.71l1.43 1.43L2 10.57 3.43 12 7 8.43 15.57 17 12 20.57 13.43 22l1.43-1.43L16.29 22l2.14-2.14 1.43 1.43 1.43-1.43-1.43-1.43L22 16.29z"
+);
 // "MoreVert"
 const MoreVertIcon = makeIcon(
   "M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"
@@ -638,6 +642,7 @@ export default function TrainingRunsView({ data, schema }: Props) {
 
   const refresh = () => call("refresh", view.refresh);
   const openLog = () => call("open_log", view.open_log);
+  const openTrain = () => call("open_train", view.open_train);
   const openEdit = (trainKey: string) =>
     call("open_edit", view.open_edit, { train_key: trainKey });
   const deleteRun = (trainKey: string) =>
@@ -987,13 +992,22 @@ export default function TrainingRunsView({ data, schema }: Props) {
           <Button
             variant="contained"
             size="small"
-            onClick={openLog}
-            startIcon={<AddIcon fontSize="small" />}
+            onClick={openTrain}
+            startIcon={<FitnessCenterIcon fontSize="small" />}
             sx={{
               backgroundColor: ORANGE,
               textTransform: "none",
               "&:hover": { backgroundColor: ORANGE },
             }}
+          >
+            Train model
+          </Button>
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={openLog}
+            startIcon={<AddIcon fontSize="small" />}
+            sx={{ textTransform: "none" }}
           >
             Log run
           </Button>
@@ -1005,7 +1019,8 @@ export default function TrainingRunsView({ data, schema }: Props) {
 
       {rows.length === 0 ? (
         <Typography color="secondary">
-          No training runs recorded yet. Click <b>Log run</b> to add one, or call{" "}
+          No training runs recorded yet. Click <b>Train model</b> to fine-tune one,{" "}
+          <b>Log run</b> to record an external run, or call{" "}
           <code>add_training_run(...)</code> from a notebook.
         </Typography>
       ) : (

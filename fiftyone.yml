@@ -14,6 +14,7 @@ operators:
   - log_training_run
   - edit_training_run
   - evaluate_training_run
+  - train_model
   - open_training_runs_panel
 panels:
   - training_runs
