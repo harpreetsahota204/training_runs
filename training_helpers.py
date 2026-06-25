@@ -78,6 +78,15 @@ def add_pred_field(inputs, default):
 
 def add_output(inputs, ctx):
     """Add the output directory + model folder name (local or cloud)."""
+    # The App's FileExplorerView yields a {"absolute_path": ...} dict; SDK
+    # callers naturally pass a plain string. Normalize the string into that
+    # dict shape here -- resolve_input runs before validation, which validates
+    # this File input as an object -- so a string survives validation (and
+    # execute reads it back via _output_dir).
+    raw = ctx.params.get("output_parent_dir")
+    if isinstance(raw, str):
+        ctx.params["output_parent_dir"] = {"absolute_path": raw}
+
     inputs.file(
         "output_parent_dir",
         required=True,
