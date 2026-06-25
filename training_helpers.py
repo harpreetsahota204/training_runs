@@ -8,6 +8,7 @@ recording flow (``init_training_run`` -> ``apply_model`` -> ``finish``) -- lives
 here so the produced record is identical regardless of which door ran it.
 """
 
+import gc
 import os
 import sys
 
@@ -190,6 +191,7 @@ def record_run(
         project_url=project_url or None,
         train_config=train_config,
     )
+    model = None
     try:
         with run:
             model, checkpoint_uri, apply_kwargs = fit()
@@ -207,6 +209,11 @@ def record_run(
     except Exception as e:
         _note_failure(run, e)
         raise
+    finally:
+        # Drop the model and free device memory so a delegated worker doesn't
+        # accumulate GPU/MPS allocations across successive runs.
+        model = None
+        _release_device_memory()
 
     ctx.ops.notify(f"Trained model '{train_key}'", variant="success")
     return {
@@ -216,6 +223,22 @@ def record_run(
         "checkpoint_uri": run.checkpoint_uri,
         "eval_key": run.eval_key,
     }
+
+
+def _release_device_memory():
+    """Free GPU/MPS memory held after a run so a delegated worker doesn't
+    accumulate device allocations across successive trainings. Best-effort:
+    collects unreferenced tensors, then empties the active backend's cache."""
+    gc.collect()
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        torch.mps.empty_cache()
 
 
 def _note_failure(run, exc):

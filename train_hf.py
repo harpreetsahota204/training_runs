@@ -39,11 +39,51 @@ TASK_LABEL_TYPES = {
     "segmentation": (fol.Segmentation,),
 }
 
-# A sensible default model id per task (free-text; any compatible id works).
-_DEFAULT_MODELS = {
-    "detection": "facebook/detr-resnet-50",
-    "classification": "google/vit-base-patch16-224",
-    "segmentation": "nvidia/mit-b0",
+# Curated model ids offered as autocomplete suggestions per task; the first in
+# each list is that task's default. The field stays free-text (AutocompleteView,
+# allow_user_input), so any other compatible id still works -- these are just
+# verified one-click choices. Each list was run end-to-end through the plugin
+# (train -> apply -> finish); ids that failed that smoke test are deliberately
+# omitted so the user hits no surprises.
+_HF_DETECTION_MODELS = [
+    "facebook/detr-resnet-50",
+    "microsoft/conditional-detr-resnet-50",
+    "IDEA-Research/dab-detr-resnet-50",
+    "hustvl/yolos-tiny",
+    "microsoft/table-transformer-detection",
+    "microsoft/table-transformer-structure-recognition",
+    "SenseTime/deformable-detr",
+    "PekingU/rtdetr_r18vd",
+    "PekingU/rtdetr_v2_r18vd",
+    "ustc-community/dfine-small-coco",
+    "ustc-community/dfine-nano-coco",
+]
+
+_HF_CLASSIFICATION_MODELS = [
+    "google/vit-base-patch16-224",
+    "facebook/deit-small-patch16-224",
+    "microsoft/swin-tiny-patch4-window7-224",
+    "facebook/convnext-tiny-224",
+    "microsoft/resnet-50",
+    "microsoft/beit-base-patch16-224",
+    "google/mobilenet_v2_1.0_224",
+    "apple/mobilevit-small",
+    "facebook/dinov2-small-imagenet1k-1-layer",
+]
+
+_HF_SEGMENTATION_MODELS = [
+    "nvidia/mit-b0",
+    "nvidia/segformer-b0-finetuned-ade-512-512",
+    "nvidia/mit-b1",
+    "apple/deeplabv3-mobilevit-small",
+    "openmmlab/upernet-convnext-tiny",
+    "Intel/dpt-large-ade",
+]
+
+_HF_MODELS = {
+    "detection": _HF_DETECTION_MODELS,
+    "classification": _HF_CLASSIFICATION_MODELS,
+    "segmentation": _HF_SEGMENTATION_MODELS,
 }
 
 _MODEL_HINTS = {
@@ -79,10 +119,17 @@ def hf_model_inputs(inputs, ctx, task):
         )
         return False
 
+    # Curated autocomplete of verified ids for this task (first = default); the
+    # field stays free-text (AutocompleteView), so any other id still works.
+    suggestions = _HF_MODELS[task]
+    model_view = types.AutocompleteView()
+    for model_id in suggestions:
+        model_view.add_choice(model_id, label=model_id)
     inputs.str(
         "model_name",
-        default=_DEFAULT_MODELS[task],
+        default=suggestions[0],
         required=True,
+        view=model_view,
         label="Model id",
         description=_MODEL_HINTS[task],
     )
