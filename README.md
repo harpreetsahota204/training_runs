@@ -122,3 +122,11 @@ they need a worker to pick them up. Start one with:
 ```
 
 Without a worker, runs sit in `QUEUED` (shown as a pending card in the panel).
+
+**macOS note:** After training, the trained model is applied to your data to
+write predictions back (and run the evaluation). On macOS this prediction
+write-back runs **single-process** — FiftyOne's parallel data loading uses the
+`spawn` start method, which can't pickle some objects on macOS. This is handled
+automatically, so training from the panel works out of the box; you don't need
+to set anything. On Linux it uses parallel workers as usual, so the write-back
+step is faster there.

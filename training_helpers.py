@@ -9,6 +9,7 @@ here so the produced record is identical regardless of which door ran it.
 """
 
 import os
+import sys
 
 import fiftyone.core.storage as fos
 import fiftyone.operators.types as types
@@ -184,7 +185,15 @@ def record_run(
         with run:
             model, checkpoint_uri, apply_kwargs = fit()
             samples = run.test_view or run.val_view or run.train_view
-            run.apply_model(model, samples=samples, **(apply_kwargs or {}))
+            apply_kwargs = dict(apply_kwargs or {})
+            # macOS uses the 'spawn' start method, which pickles the DataLoader
+            # worker payload; FiftyOne's collate/get_item can carry an
+            # unpicklable staticmethod, so write predictions back single-process
+            # there. (A module-level core fix would let workers run on macOS
+            # too -- tracked separately.)
+            if sys.platform == "darwin":
+                apply_kwargs.setdefault("num_workers", 0)
+            run.apply_model(model, samples=samples, **apply_kwargs)
             run.finish(checkpoint_uri=checkpoint_uri)
     except Exception as e:
         _note_failure(run, e)
