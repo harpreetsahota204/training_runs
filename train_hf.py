@@ -23,7 +23,6 @@ import fiftyone.core.storage as fos
 import fiftyone.operators.types as types
 import fiftyone.utils.training as fout
 
-from .operators import _dropdown
 from . import training_helpers as th
 
 # transformers is an optional dependency; check without importing the heavy
@@ -141,7 +140,7 @@ def train_hf(ctx, train_key):
 # --- shared core helpers ---------------------------------------------------
 
 
-def _config(ctx, task, **extra):
+def _config(ctx, task):
     """The opaque ``train_config`` recorded on the run."""
     cfg = {
         "model": ctx.params["model_name"],
@@ -149,7 +148,6 @@ def _config(ctx, task, **extra):
         "epochs": ctx.params.get("epochs", 5),
         "batch_size": ctx.params.get("batch_size", 4),
         "learning_rate": ctx.params.get("learning_rate", 5e-5),
-        **extra,
     }
     if ctx.user_id:
         cfg["triggered_by"] = ctx.user_id
@@ -231,10 +229,10 @@ def _index_classes(classes):
     return label2id, {i: c for c, i in label2id.items()}
 
 
-def _mapping(label2id, id2label, **extra):
+def _mapping(label2id, id2label):
     """The ``class_mapping.json`` payload saved alongside the model (``json``
     coerces the int ``id2label`` keys to strings on dump)."""
-    return {"label2id": label2id, "id2label": id2label, **extra}
+    return {"label2id": label2id, "id2label": id2label}
 
 
 def _resolve_train_val(ctx, train_arg, val_arg):
