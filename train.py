@@ -2,11 +2,11 @@
 result through the engine surface only.
 
 The form is task-first: pick what you want to train (detection, classification,
-segmentation, pose) -- only tasks some label field can actually drive are
-offered -- then the label field choices are filtered to the fields whose type +
-contents support that task (segmentation needs a semantic ``Segmentation``
-field, a ``Detections`` field with instance masks, or a filled ``Polylines``
-field; etc.). The framework choices -- Ultralytics YOLO or a HuggingFace
+segmentation, pose) -- all tasks are shown, and picking one whose label type the
+dataset lacks surfaces a pointer to the annotation docs -- then the label field
+choices are filtered to the fields whose type + contents support that task
+(segmentation needs a semantic ``Segmentation`` field, a ``Detections`` field
+with instance masks, or a filled ``Polylines`` field; etc.). The framework choices -- Ultralytics YOLO or a HuggingFace
 AutoModel -- are then filtered to those that can train that task + label type
 (e.g. pose is YOLO-only, HF segmentation needs semantic masks), so the user
 can't pick an incompatible combination. The trained model is funnelled through
@@ -32,9 +32,24 @@ _FRAMEWORK_LABELS = {
     "huggingface": "HuggingFace AutoModel",
 }
 
-# Tasks offered, in display order. A task is shown only when some label field
-# can actually drive it (see ``_available_tasks``).
+# Tasks offered, in display order. All are always shown; if the dataset lacks
+# the labels a task needs, the form surfaces a docs pointer instead of the
+# label-field picker (see ``_TASK_NEEDS`` / ``_no_label_message``).
 _TASKS = ("detection", "classification", "segmentation", "pose")
+
+# FiftyOne annotation docs, linked from the "you don't have these labels" guide.
+_DOCS_URL = "https://docs.voxel51.com/user_guide/annotation.html"
+
+# What each task needs, phrased for that guidance message.
+_TASK_NEEDS = {
+    "detection": "Detections field",
+    "classification": "Classification field",
+    "segmentation": (
+        "Segmentation field (or a Detections field with instance masks, or a "
+        "filled Polylines field)"
+    ),
+    "pose": "Keypoints field",
+}
 
 # Field suffix to count distinct classes on, per label type (for the notice
 # shown after the label field is picked).
@@ -95,6 +110,15 @@ def _fields_for_task(ctx, task):
 def _available_tasks(ctx):
     """Tasks (in display order) that at least one label field can drive."""
     return [task for task in _TASKS if _fields_for_task(ctx, task)]
+
+
+def _no_label_message(task):
+    """Markdown guidance shown when the dataset lacks the labels ``task`` needs."""
+    return (
+        f"⚠️ **This dataset has no {_TASK_NEEDS[task]}.**\n\n"
+        f"The **{task}** task needs a {_TASK_NEEDS[task]}. Add these annotations "
+        f"to your dataset first — see the [annotation guide]({_DOCS_URL})."
+    )
 
 
 def _valid_frameworks(ctx, task, label_field):
@@ -158,37 +182,30 @@ class TrainModel(foo.Operator):
 
         th.add_train_key(inputs)
 
-        # 1) Task -- only those some label field can actually drive.
-        tasks = _available_tasks(ctx)
-        if not tasks:
-            inputs.view(
-                "no_fields",
-                types.Warning(
-                    label="No trainable label fields found",
-                    description=(
-                        "Need a Detections, Classification, Keypoints, "
-                        "Segmentation, or filled Polylines field"
-                    ),
-                ),
-            )
-            return th.page(inputs)
+        # 1) Task -- show all; default to one the dataset can actually drive.
+        tasks = list(_TASKS)
         task_view = types.RadioGroup()
         for t in tasks:
             task_view.add_choice(t, label=t.capitalize())
+        available = _available_tasks(ctx)
+        default_task = available[0] if available else tasks[0]
         inputs.enum(
             "task",
             tasks,
-            default=tasks[0],
+            default=default_task,
             required=True,
             view=task_view,
             label="Task",
         )
-        task = ctx.params.get("task")
+        task = ctx.params.get("task") or default_task
         if task not in tasks:
-            task = tasks[0]
+            task = default_task
 
-        # 2) Label field -- those whose type + contents can drive this task.
+        # 2) Label field -- or a docs pointer if this task's labels are absent.
         fields = _fields_for_task(ctx, task)
+        if not fields:
+            inputs.md(_no_label_message(task), name="no_label_type")
+            return th.page(inputs)
         inputs.enum(
             "label_field",
             fields,
@@ -254,6 +271,17 @@ class TrainModel(foo.Operator):
         train_key = ctx.params["train_key"]
         if not _valid_identifier(ctx, train_key):
             return
+
+        # Guard SDK callers: the App form blocks this, but execute_operator can
+        # be handed a task whose label type isn't on the dataset. Raise (rather
+        # than notify) so the message reaches the SDK caller, before any run is
+        # registered.
+        task = ctx.params.get("task", "detection")
+        if ctx.params.get("label_field") not in _fields_for_task(ctx, task):
+            raise ValueError(
+                f"The '{task}' task needs a {_TASK_NEEDS[task]}, which this "
+                f"dataset doesn't have. Add the annotations first — see {_DOCS_URL}"
+            )
 
         # Building the spec is cheap (resolves splits + config); the heavy fit
         # runs inside record_run's run block. Guard the whole thing so a
