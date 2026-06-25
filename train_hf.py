@@ -16,6 +16,7 @@ the user's chosen output directory, which may be local or cloud.
 import importlib.util
 import json
 import os
+import sys
 
 import fiftyone.core.labels as fol
 import fiftyone.core.storage as fos
@@ -124,6 +125,10 @@ def train_hf(ctx, train_key):
     ``forward()`` reads ``self.device`` (e.g. DETR).
     """
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    if sys.platform == "darwin":
+        # Apple's MPS backend lacks some detector ops (e.g. deformable
+        # attention); fall back to CPU for those instead of crashing.
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
     task = ctx.params.get("task", "detection")
     if task == "detection":

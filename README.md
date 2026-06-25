@@ -130,3 +130,8 @@ write-back runs **single-process** — FiftyOne's parallel data loading uses the
 automatically, so training from the panel works out of the box; you don't need
 to set anything. On Linux it uses parallel workers as usual, so the write-back
 step is faster there.
+
+On macOS, HuggingFace training additionally falls back to CPU for operations
+Apple's MPS backend doesn't support (some detection models, e.g.
+deformable-attention DETR), so HF fine-tuning can be slow on a Mac —
+Ultralytics YOLO is the smoother macOS path.
