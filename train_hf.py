@@ -52,14 +52,6 @@ _MODEL_HINTS = {
     "segmentation": "Any AutoModelForSemanticSegmentation id, e.g. nvidia/mit-b0",
 }
 
-# FiftyOne bboxes are normalized [x, y, w, h]; each model family expects a
-# different layout. Used by the detection bridge's annotation builder.
-BBOX_FORMATS = {
-    "coco": "COCO [x, y, w, h] absolute pixels (DETR family)",
-    "yolo": "YOLO [cx, cy, w, h] normalized 0-1 (YOLOS)",
-    "xyxy": "XYXY [x1, y1, x2, y2] absolute pixels (torchvision)",
-}
-
 
 def hf_model_inputs(inputs, ctx, task):
     """Add the HuggingFace model + hyperparameter fields for the chosen ``task``
@@ -96,14 +88,6 @@ def hf_model_inputs(inputs, ctx, task):
     )
 
     if task == "detection":
-        inputs.enum(
-            "bbox_format",
-            list(BBOX_FORMATS),
-            default="coco",
-            view=_dropdown(list(BBOX_FORMATS)),
-            label="Bounding box format",
-            description="The format your model expects (DETR=coco, YOLOS=yolo)",
-        )
         inputs.float(
             "confidence",
             default=0.25,
@@ -327,40 +311,30 @@ def _train_classification(ctx):
 # --- detection -------------------------------------------------------------
 
 
-def _fo_bbox_to(bbox_format, bbox, w, h):
-    """FiftyOne normalized [x, y, w, h] -> the model's expected layout."""
-    rx, ry, rw, rh = bbox
-    if bbox_format == "yolo":
-        return [rx + rw / 2, ry + rh / 2, rw, rh]
-    if bbox_format == "xyxy":
-        return [rx * w, ry * h, (rx + rw) * w, (ry + rh) * h]
-    return [rx * w, ry * h, rw * w, rh * h]  # coco
+def _annotation(det, label2id, w, h):
+    """A COCO-detection annotation dict for one FiftyOne detection.
 
-
-def _bbox_area(bbox_format, bbox, w, h):
-    if bbox_format == "yolo":
-        return bbox[2] * w * bbox[3] * h
-    if bbox_format == "xyxy":
-        return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-    return bbox[2] * bbox[3]  # coco
-
-
-def _annotation(bbox_format, det, label2id, w, h):
-    """A COCO-style annotation dict for one detection in the model's layout."""
-    bbox = _fo_bbox_to(bbox_format, det.bounding_box, w, h)
+    Every HuggingFace object-detection image processor (DETR / YOLOS / RT-DETR
+    and the rest of the ``AutoModelForObjectDetection`` family) expects COCO
+    ``[x, y, w, h]`` in absolute pixels and converts to the model's internal
+    normalized ``cxcywh`` itself (``do_convert_annotations=True``). So the only
+    transform we do is FiftyOne's normalized box -> absolute pixels; there is no
+    per-model bbox format to choose.
+    """
+    rx, ry, rw, rh = det.bounding_box
+    bbox = [rx * w, ry * h, rw * w, rh * h]
     return {
         "bbox": bbox,
         "category_id": label2id[det.label],
-        "area": _bbox_area(bbox_format, bbox, w, h),
+        "area": bbox[2] * bbox[3],
         "iscrowd": 0,
     }
 
 
 def _train_detection(ctx):
     label_field = ctx.params["label_field"]
-    bbox_format = ctx.params.get("bbox_format", "coco")
     train_arg, val_arg, test_arg = th.resolve_split_args(ctx)
-    train_config = _config(ctx, "detection", bbox_format=bbox_format)
+    train_config = _config(ctx, "detection")
 
     def fit():
         import torch
@@ -407,7 +381,7 @@ def _train_detection(ctx):
                 meta = d.get("metadata")
                 w, h = (meta.width, meta.height) if meta is not None else image.size
                 annotations = [
-                    _annotation(bbox_format, det, label2id, w, h)
+                    _annotation(det, label2id, w, h)
                     for det in d["detections"].detections
                 ]
                 inputs = processor(
@@ -450,7 +424,7 @@ def _train_detection(ctx):
         )
         trainer.train()
 
-        mapping = _mapping(label2id, id2label, bbox_format=bbox_format)
+        mapping = _mapping(label2id, id2label)
         apply_kwargs = {"confidence_thresh": ctx.params.get("confidence", 0.25)}
         return (
             trainer.model,

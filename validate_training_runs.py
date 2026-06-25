@@ -2,31 +2,20 @@
 """
 Validate the `exp-model-train-log` training-run branch end to end.
 
-Runs the SDK engine end to end against the `quickstart` dataset and writes a
-full report to a .txt you can paste back for diagnosis:
+Exercises the SDK engine against `quickstart` and writes a full report to a .txt
+you can paste back for diagnosis:
 
-  * Section 4.2 (write path): init_training_run -> finish (+auto-eval) -> linkage,
-    log_predictions, context-manager lifecycle, one-call add_training_run, the
-    door-3 "link existing eval" profile, and the 1:1 eval-weld policy.
-  * Section 4.4 (read/manage): has/list/get/load/rename/delete.
-  * Contracts: eval_key defaults to train_key; keys are NOT slugged (a
-    non-identifier raises); gt/pred required iff an eval runs; auto_eval=None
-    inference; view-stage capture + rehydration; review_status/note round-trip.
+  * 4.2 write: init -> finish (+auto-eval), linkage, log_predictions, the
+    context-manager lifecycle, one-call add_training_run, the door-3 "link
+    existing eval" profile, and the 1:1 eval-weld policy.
+  * 4.4 read/manage: has/list/get/load/rename/delete.
+  * Contracts: eval_key defaults to train_key; no slugging; gt/pred required iff
+    an eval runs; auto_eval inference; view-stage rehydration; review/note.
   * App surface (best-effort): the plugin's operators + panel are registered
-    (SKIPs if the plugin isn't installed yet -- the engine checks still run).
+    (SKIPs if it isn't installed yet -- the engine checks still run).
 
-Design notes:
-  - Every step runs INDEPENDENTLY in its own try/except. One failure does not
-    abort the run -- it's recorded with a full traceback and the rest continue,
-    so the report is a complete map of what works.
-  - All stdout/stderr (including FiftyOne's own prints, e.g. eval reports) is
-    tee'd into the report file.
-  - It probes the real object surfaces (dir(run), config fields) so naming
-    differences from the branch notes are visible.
-
-Usage:
-    python validate_training_runs.py
-Then send back:  training_runs_validation_report.txt
+Each step runs in its own try/except, so one failure is recorded with a full
+traceback and the rest continue. Run it with: python validate_training_runs.py
 """
 
 import os
@@ -37,78 +26,138 @@ import datetime
 
 REPORT = "training_runs_validation_report.txt"
 
+
 # --- tee stdout/stderr into the report file -------------------------------
 class _Tee:
-    """Writes to multiple streams. Proxies common stream attributes
-    (encoding, isatty, fileno, ...) to the first real stream so libraries
-    that introspect sys.stdout -- e.g. FiftyOne/ETA progress bars, which read
-    sys.stdout.encoding -- don't choke on the tee."""
+    """A stdout/stderr replacement that writes to several streams at once.
+
+    Proxies common stream attributes (encoding, isatty, fileno, ...) to the
+    first real stream so libraries that introspect sys.stdout -- e.g.
+    FiftyOne/ETA progress bars, which read sys.stdout.encoding -- don't choke
+    on the tee.
+    """
+
     def __init__(self, *streams):
         self.streams = streams
         self._primary = streams[0] if streams else None
+
     def write(self, s):
+        # Never let one broken stream (e.g. a closed file) abort the others.
         for st in self.streams:
             try:
                 st.write(s)
             except Exception:
                 pass
+
     def flush(self):
         for st in self.streams:
             try:
                 st.flush()
             except Exception:
                 pass
+
     @property
     def encoding(self):
         return getattr(self._primary, "encoding", "utf-8")
+
     def isatty(self):
-        # report non-tty so progress bars render simply and never query a tty
+        # Report non-tty so progress bars render simply and never query a tty.
         return False
+
     def fileno(self):
         return self._primary.fileno()
+
     def __getattr__(self, name):
-        # anything we didn't explicitly define -> defer to the primary stream
+        # Anything we didn't explicitly define -> defer to the primary stream.
         return getattr(self._primary, name)
 
+
 # --- step harness ---------------------------------------------------------
-S = {}            # shared state across steps
-RESULTS = []      # (num, name, status)
+S = {}            # shared state across steps (dataset, run, key, ...)
+RESULTS = []      # (num, name, status) one entry per step, for the summary
+
 
 class SkipStep(Exception):
+    """Raised by a step (usually via ``need``) to mark itself SKIP, not FAIL."""
+
     pass
 
+
 def step(num, name, fn):
+    """Run one step in isolation, recording PASS / SKIP / FAIL.
+
+    A step is just a function; any exception it raises is caught here so a
+    single failure never aborts the rest of the run. The outcome (and a full
+    traceback on failure) is printed and appended to ``RESULTS``.
+    """
     print("\n" + "=" * 78)
     print("[%s] %s" % (num, name))
     print("-" * 78)
     try:
         fn()
         RESULTS.append((num, name, "PASS"))
-        print(">>> [%s] PASS" % num)
+        print("✅ [%s] PASS" % num)
     except SkipStep as e:
         RESULTS.append((num, name, "SKIP"))
-        print(">>> [%s] SKIP: %s" % (num, e))
+        print("⏭️  [%s] SKIP: %s" % (num, e))
     except Exception:
         RESULTS.append((num, name, "FAIL"))
-        print(">>> [%s] FAIL" % num)
+        print("❌ [%s] FAIL" % num)
         traceback.print_exc()
 
+
 def need(*keys):
+    """Skip the current step unless every prerequisite is in ``S``.
+
+    Steps stash what they build in ``S`` (e.g. the dataset, the run); a later
+    step calls ``need(...)`` so it SKIPs cleanly when an earlier step it
+    depends on failed, instead of raising a confusing KeyError.
+    """
     for k in keys:
         if k not in S:
             raise SkipStep("prerequisite missing: %s" % k)
 
-def probe(label, obj):
-    """Dump an object's public surface -- helps reconcile API naming."""
-    print("  %s : type=%s" % (label, type(obj).__name__))
-    attrs = [a for a in dir(obj) if not a.startswith("_")]
-    print("  %s.public = %s" % (label, attrs))
+
+# The members we actually care about on each training-run object. probe()
+# reports only these (present vs absent) rather than the whole inherited dir().
+_RUN_SURFACE = (
+    "train_key", "status", "eval_key", "checkpoint_uri", "project_url",
+    "auto_eval", "train_config",
+    "train_view", "val_view", "test_view", "eval_view", "eval_results",
+    "evaluate", "finish", "apply_model", "log_predictions", "link_evaluation",
+)
+_CONFIG_SURFACE = (
+    "train_key", "gt_field", "pred_field", "auto_eval", "status", "eval_key",
+    "checkpoint_uri", "project_url", "train_config", "review_status", "note",
+    "train_view_ids", "val_view_ids", "test_view_ids",
+    "train_view_stages", "val_view_stages", "test_view_stages",
+)
+_INFO_SURFACE = ("key", "timestamp", "config")
+
+
+def probe(label, obj, keep):
+    """Report only the members we care about (green check / red x).
+
+    Presence is read from ``dir(obj)`` and the callable mark from the class
+    attribute, so we never trigger a property getter (e.g. ``eval_view``
+    before ``finish``). ``keep`` is the curated surface to check.
+    """
+    members = set(dir(obj))
+    print("  %s (%s):" % (label, type(obj).__name__))
+    for name in keep:
+        present = name in members
+        # () marks a method; properties/attrs print bare.
+        mark = "()" if callable(getattr(type(obj), name, None)) else ""
+        print("    %-22s %s" % (name + mark, "✅" if present else "⛔️"))
+
 
 # =========================================================================
 # Steps
 # =========================================================================
 def s0_environment():
+    """Confirm we're on the branch: the training API exists on ``fo.Dataset``."""
     import fiftyone as fo
+
     S["fo"] = fo
     print("python           :", sys.version.split()[0], "on", platform.platform())
     print("fiftyone version :", fo.__version__)
@@ -122,10 +171,10 @@ def s0_environment():
     ]
     present = {m: hasattr(fo.Dataset, m) for m in expected}
     for m, ok in present.items():
-        print("  Dataset.%-22s %s" % (m, "present" if ok else "MISSING"))
+        print("  Dataset.%-22s %s" % (m, "✅" if ok else "⛔️"))
     # has_training_runs may be a property -> appears on the class too
     print("  Dataset.%-22s %s" % ("has_training_runs",
-          "present" if hasattr(fo.Dataset, "has_training_runs") else "MISSING"))
+          "✅" if hasattr(fo.Dataset, "has_training_runs") else "⛔️"))
     missing = [m for m, ok in present.items() if not ok]
     if missing:
         raise RuntimeError(
@@ -133,7 +182,9 @@ def s0_environment():
             "exp-model-train-log (checkout the branch + `pip install -e .`)" % missing
         )
 
+
 def s1_build_dataset():
+    """Clone quickstart into a throwaway dataset with a 70/15/15 tag split."""
     need("fo")
     fo = S["fo"]
     import fiftyone.zoo as foz
@@ -153,7 +204,13 @@ def s1_build_dataset():
     for tag in ("train", "val", "test"):
         print("  %-5s %d" % (tag, dataset.match_tags(tag).count()))
 
+
 def s2_init_run():
+    """4.2 write: open a run and confirm the splits + view-stage capture.
+
+    ``init_training_run`` freezes each split to sample IDs and (separately)
+    serializes its view stages; this checks both were captured.
+    """
     need("fo", "dataset")
     fo = S["fo"]
     dataset = S["dataset"]
@@ -176,8 +233,8 @@ def s2_init_run():
     print("splits    : train=%d val=%d test=%d" % (
         run.train_view.count(), run.val_view.count(), run.test_view.count()))
     print("eval_key  :", getattr(run, "eval_key", "<no .eval_key>"))
-    # view stages (intent) captured alongside ids (fact); names are None
-    # because live views, not saved-view names, were passed
+    # View stages (intent) are captured alongside ids (fact); the names are
+    # None here because live views, not saved-view names, were passed.
     c = run.config
     for split in ("train", "val", "test"):
         stages = getattr(c, "%s_view_stages" % split, "<absent>")
@@ -188,12 +245,14 @@ def s2_init_run():
             "%s_view_stages not captured" % split
         )
         assert name is None, "%s_view_name should be None for live views" % split
-    # surface probe -- shows the REAL method/attr names on the run object
-    probe("run", run)
+    # Surface probe -- confirms the run object exposes the members we rely on.
+    probe("run", run, _RUN_SURFACE)
     if hasattr(run, "config"):
-        probe("run.config", run.config)
+        probe("run.config", run.config, _CONFIG_SURFACE)
+
 
 def s3_finish():
+    """4.2 write: finish triggers auto-eval; eval_key defaults to train_key."""
     need("run")
     run = S["run"]
     res = run.finish(checkpoint_uri="s3://my-bucket/quickstart-baseline/best.pt")
@@ -202,47 +261,58 @@ def s3_finish():
     print("eval_key      :", getattr(run, "eval_key", "?"))
     print("checkpoint_uri:", getattr(run, "checkpoint_uri", "?"))
     print("eval_view     :", run.eval_view.count(), "samples")
-    # finished + auto-eval ran; eval_key DEFAULTS to train_key (no override)
+    # Finished + auto-eval ran; eval_key DEFAULTS to train_key (no override).
     assert run.status == "completed", "finish() should leave status=completed"
     assert run.eval_key == S["key"], (
         "eval_key should default to train_key (%r), got %r"
         % (S["key"], run.eval_key)
     )
 
+
 def s4_linkage():
+    """4.2 weld: the auto-eval links back to the run that produced it."""
     need("fo", "dataset", "run", "key")
     dataset = S["dataset"]
     run = S["run"]
     key = S["key"]
     res = S.get("eval_results")
-    # forward: print the eval report (auto-eval here is always a detection eval)
+    # Forward: print the eval report (auto-eval here is always a detection eval).
     if res is not None:
         res.print_report()
-    # back-pointer
+    # Back-pointer: the eval's config records which run created it.
     ek = run.eval_key
     einfo = dataset.get_evaluation_info(ek)
     back = getattr(einfo.config, "train_key", "<no train_key on eval config>")
     print("eval '%s' -> back-pointer train_key = %s" % (ek, back))
     assert back == key, "back-pointer mismatch: %r != %r" % (back, key)
 
+
 def s5_discovery():
+    """4.4 manage: the has/list discovery surface (incl. the status filter)."""
     need("dataset", "key")
     dataset = S["dataset"]
     key = S["key"]
-    # has_training_runs is a property (verified fact); access it directly
+    # has_training_runs is a property (verified fact); access it directly.
     print("has_training_runs     :", dataset.has_training_runs)
     print("has_training_run(key) :", dataset.has_training_run(key))
     print("list_training_runs()  :", dataset.list_training_runs())
     print("list(status=completed):", dataset.list_training_runs(status="completed"))
 
+
 def s6_get_info():
+    """4.4 manage: config survives the DB round-trip and stages rehydrate.
+
+    Reads back every config field, rebuilds a live view from the stored
+    stages and checks it matches the frozen ids, and confirms review_status /
+    note round-trip without disturbing the execution status.
+    """
     need("dataset", "key")
     dataset = S["dataset"]
     info = dataset.get_training_info(S["key"])
     S["info"] = info
-    probe("info", info)
+    probe("info", info, _INFO_SURFACE)
     if hasattr(info, "config"):
-        probe("info.config", info.config)
+        probe("info.config", info.config, _CONFIG_SURFACE)
         c = info.config
         for attr in ("eval_key", "checkpoint_uri", "project_url", "train_config",
                      "status", "train_view_ids", "val_view_ids", "test_view_ids",
@@ -254,9 +324,9 @@ def s6_get_info():
             if attr.endswith("_stages") and isinstance(v, (list, tuple)):
                 v = "%d stage(s)" % len(v)
             print("  config.%-18s %s" % (attr, v))
-        # stages survive the DB round-trip (get_training_info reloads) AND
-        # are usable, not just stored: rebuild a live DatasetView from the
-        # stored stages and check it matches the frozen membership
+        # Stages survive the DB round-trip (get_training_info reloads) AND are
+        # usable, not just stored: rebuild a live DatasetView from the stored
+        # stages and check its membership matches the frozen ids.
         import fiftyone.utils.training as fout
         for split in ("train", "val", "test"):
             stages = getattr(c, "%s_view_stages" % split, None)
@@ -270,8 +340,8 @@ def s6_get_info():
                 % split
             )
         print("  stages rehydrate -> live views matching frozen ids (3/3)")
-        # review_status / note: default correctly, and round-trip when written
-        # through the run framework (the path the panel will use)
+        # review_status / note default correctly and round-trip when written
+        # through the run framework (the path the panel uses).
         assert c.review_status == "new", "review_status should default to 'new'"
         assert c.note is None, "note should default to None"
         run = dataset.load_training_run(S["key"])
@@ -289,7 +359,9 @@ def s6_get_info():
     print("info.key       :", getattr(info, "key", "<absent>"))
     print("info.timestamp :", getattr(info, "timestamp", "<absent>"))
 
+
 def s7_reload():
+    """4.4 manage: a reloaded run exposes the same status, eval, and views."""
     need("dataset", "key")
     dataset = S["dataset"]
     r = dataset.load_training_run(S["key"])
@@ -300,7 +372,14 @@ def s7_reload():
     print("reloaded splits  : train=%d val=%d test=%d" % (
         r.train_view.count(), r.val_view.count(), r.test_view.count()))
 
+
 def s8_log_predictions():
+    """4.2 write: the manual log_predictions path + per-sample metric fields.
+
+    Fabricates predictions from ground truth (no model needed) so the
+    log_predictions -> finish path and the per-sample metric field it writes
+    can be checked offline.
+    """
     need("fo", "dataset")
     fo = S["fo"]
     dataset = S["dataset"]
@@ -314,7 +393,7 @@ def s8_log_predictions():
         pred_field="preds_logged",   # NEW field we populate
         auto_eval=True,
     )
-    # fabricate predictions for val+test from ground truth (no model needed)
+    # Fabricate predictions for val+test from ground truth (no model needed).
     eval_split = dataset.match_tags(["val", "test"])
     predictions, metrics = {}, {}
     for s in eval_split.select_fields(["id", "ground_truth"]):
@@ -332,7 +411,13 @@ def s8_log_predictions():
     mf = "%s_img_loss" % log_key
     print("per-sample metric field '%s' present: %s" % (mf, mf in dataset.get_field_schema()))
 
+
 def s9_context_manager():
+    """4.2 write: the ``with run`` lifecycle -- clean exit finishes, error fails.
+
+    (a) a clean block auto-finishes the run; (b) an exception inside the block
+    is re-raised AND recorded (status 'failed' + stored error).
+    """
     need("dataset")
     dataset = S["dataset"]
     # (a) clean exit -> auto finish
@@ -362,11 +447,15 @@ def s9_context_manager():
     err = getattr(failed, "error", None) or getattr(getattr(failed, "config", None), "error", None)
     print("error stored    :", bool(err))
 
+
 def s9b_one_call():
+    """4.2 write: add_training_run (init+finish in one call) + saved-view name.
+
+    Passing a saved view BY NAME captures the name breadcrumb;
+    association-only (auto_eval=False) needs no gt/pred and runs no eval.
+    """
     need("fo", "dataset")
     dataset = S["dataset"]
-    # a saved view passed BY NAME -> the name breadcrumb is captured;
-    # association-only (auto_eval=False) -> no gt/pred required
     if dataset.has_saved_view("val_split"):
         dataset.delete_saved_view("val_split")
     dataset.save_view("val_split", dataset.match_tags("val"))
@@ -388,7 +477,7 @@ def s9b_one_call():
     assert run.eval_key is None, "association-only run must not run an eval"
     assert c.train_view_name is None
     assert c.val_view_name == "val_split"
-    # name + stages survive the DB round-trip
+    # The name + stages survive the DB round-trip.
     c2 = dataset.get_training_info("quickstart_oneshot").config
     assert c2.val_view_name == "val_split"
     assert isinstance(c2.val_view_stages, list) and len(c2.val_view_stages) > 0
@@ -397,9 +486,10 @@ def s9b_one_call():
 
 
 def s10_teardown():
+    """4.4 manage: rename + delete the runs (also the test's teardown)."""
     need("dataset")
     dataset = S["dataset"]
-    # rename + delete ARE the §4.4 surface under test -- let them bubble
+    # rename + delete ARE the §4.4 surface under test -- let them bubble.
     dataset.rename_training_run("ctx_clean", "ctx_clean_renamed")
     print("after rename    :", dataset.list_training_runs())
     dataset.delete_training_run("ctx_boom")
@@ -407,13 +497,14 @@ def s10_teardown():
     dataset.delete_training_runs()
     print("after delete all:", dataset.list_training_runs())
 
+
 def s11_door3_link_existing_eval():
     """Door-3 profile: a run that LINKS a pre-existing eval instead of
     running one. No gt/pred, no evaluation executed, back-pointer stamped."""
     need("fo", "dataset")
     dataset = S["dataset"]
-    # a standalone eval, created the way a user would by hand (quickstart
-    # ships a populated `predictions` field)
+    # A standalone eval, created the way a user would by hand (quickstart
+    # ships a populated `predictions` field).
     test_view = dataset.match_tags("test")
     test_view.evaluate_detections(
         "predictions", gt_field="ground_truth", eval_key="standalone_eval"
@@ -437,16 +528,16 @@ def s11_door3_link_existing_eval():
     assert len(dataset.list_evaluations()) == n_evals_before, (
         "linking must not run a new evaluation"
     )
-    # back-pointer stamped on the EXISTING eval's config
+    # Back-pointer stamped on the EXISTING eval's config.
     back = getattr(
         dataset.get_evaluation_info("standalone_eval").config, "train_key", None
     )
     print("back-pointer  :", back)
     assert back == "door3_log"
-    # forward traversal works
+    # Forward traversal works.
     assert run.eval_results is not None
     print("eval_view     :", run.eval_view.count(), "samples")
-    # auto_eval=True + eval_key is rejected as contradictory
+    # auto_eval=True + eval_key is rejected as contradictory.
     try:
         dataset.init_training_run(
             "door3_bad",
@@ -613,24 +704,27 @@ def s15_plugin_operators():
         print("  %-8s %-44s %s" % (
             kind, uri, "registered" if exists else "MISSING"))
 
+    # Nothing registered -> the plugin isn't installed; SKIP, don't FAIL.
     if not any(found.values()):
         raise SkipStep(
             "no '%s' operators registered -- install the plugin (see "
             "README) and re-run to validate the App surface" % plugin
         )
+    # Some registered but not all -> a real problem worth failing on.
     missing = [k for k, ok in found.items() if not ok]
     assert not missing, "plugin registered but missing: %s" % missing
 
 
 # =========================================================================
 def main():
+    """Run every step in order, tee output to the report file, print a summary."""
     fh = open(REPORT, "w")
     orig_out, orig_err = sys.stdout, sys.stderr
     sys.stdout = _Tee(orig_out, fh)
     sys.stderr = _Tee(orig_err, fh)
     try:
         print("#" * 78)
-        print("# TRAINING-RUN BRANCH VALIDATION REPORT")
+        print("# 🚂  TRAINING-RUN BRANCH VALIDATION REPORT")
         print("# generated:", datetime.datetime.now().isoformat())
         print("#" * 78)
 
@@ -652,23 +746,24 @@ def main():
         step("14", "4.2  auto_eval=None inference (both directions)", s14_auto_eval_inference)
         step("15", "plugin operators + panel registered (App surface)", s15_plugin_operators)
 
-        # final dataset cleanup
+        # Drop the throwaway dataset (best-effort -- don't mask a step failure).
         try:
             if "fo" in S and "name" in S and S["fo"].dataset_exists(S["name"]):
                 S["fo"].delete_dataset(S["name"])
-                print("\ncleaned up dataset:", S["name"])
+                print("\n\U0001f9f9 cleaned up dataset:", S["name"])
         except Exception:
             traceback.print_exc()
 
-        # summary
+        # Summary: one line per step, then the totals and what to do next.
         print("\n" + "#" * 78)
-        print("# SUMMARY")
+        print("# 📋  SUMMARY")
         print("#" * 78)
         npass = sum(1 for _, _, s in RESULTS if s == "PASS")
         nfail = sum(1 for _, _, s in RESULTS if s == "FAIL")
         nskip = sum(1 for _, _, s in RESULTS if s == "SKIP")
+        icon = {"PASS": "✅", "SKIP": "⏭️ ", "FAIL": "❌"}
         for num, name, st in RESULTS:
-            print("  [%2s] %-6s %s" % (num, st, name))
+            print("  %s [%2s] %-6s %s" % (icon[st], num, st, name))
         print("-" * 40)
         print("  PASS=%d  FAIL=%d  SKIP=%d" % (npass, nfail, nskip))
         if nfail:
@@ -681,13 +776,15 @@ def main():
             print("     does not gate the engine. Install the plugin per the README to")
             print("     light it up.")
         if not nfail:
-            print("\n  -> Engine green: the branch delivers Piece 1 (4.2 + 4.4) and the")
-            print("     SDK contracts. If step 15 passed too, the App plugin is wired.")
+            print("\n  -> Engine green: the branch delivers the SDK contracts.")
+            print("       If step 15 passed too, the App plugin is wired.")
     finally:
+        # Always restore the real streams, even if the run blew up.
         sys.stdout, sys.stderr = orig_out, orig_err
         fh.close()
-    print("\nWrote report to: %s" % os.path.abspath(REPORT))
-    print("Open the App and inspect the panel.")
+    print("\n📄 Wrote report to: %s" % os.path.abspath(REPORT))
+    print("👀 Open the App and inspect the panel.")
+
 
 if __name__ == "__main__":
     main()
