@@ -136,6 +136,41 @@ def _project_input(inputs, default=None):
     )
 
 
+def image_group_slices(ctx):
+    """The dataset's image group slices, or ``[]`` if it isn't grouped.
+
+    Training applies an image model, which can't run on a grouped collection
+    directly, so the form makes the user flatten to one image slice.
+    """
+    dataset = ctx.dataset
+    if dataset.media_type != "group":
+        return []
+    return [
+        name
+        for name, media_type in dataset.group_media_types.items()
+        if media_type == "image"
+    ]
+
+
+def selected_group_slice(ctx):
+    """The chosen image group slice, or ``None`` if the dataset isn't grouped."""
+    if ctx.dataset.media_type != "group":
+        return None
+    return ctx.params.get("group_slice")
+
+
+def flatten_to_slice(samples, group_slice=None):
+    """Flatten a grouped collection to a single image slice so image-model ops
+    (``apply_model``, ``evaluate_*``) can run; a no-op for ungrouped
+    collections. Uses ``group_slice`` when given (the slice a run trained on),
+    else any image slice."""
+    if samples is None or samples.media_type != "group":
+        return samples
+    if group_slice:
+        return samples.select_group_slices(group_slice)
+    return samples.select_group_slices(media_type="image")
+
+
 def _resolve_view_arg(ctx, target):
     """Maps a dropdown choice to a ``train_view`` arg for the engine.
 
@@ -329,7 +364,11 @@ def _populated_pred_count(dataset, config, pred_field):
     ids = list(dict.fromkeys(ids))
     if not ids:
         return 0
-    return dataset.select(ids).exists(pred_field).count()
+    samples = dataset.select(ids)
+    if samples.media_type == "group":
+        # Count on the slice the run trained on, not the active slice.
+        samples = flatten_to_slice(samples, (config.train_config or {}).get("group_slice"))
+    return samples.exists(pred_field).count()
 
 
 class EvaluateTrainingRun(foo.Operator):
@@ -563,12 +602,32 @@ class EvaluateTrainingRun(foo.Operator):
             )
             return
 
+        # Grouped runs: the engine's data-driven eval view is grouped
+        # (dataset.select(ids)), which evaluate_* rejects. Flatten to the slice
+        # the run trained on and evaluate that view explicitly; ungrouped runs
+        # keep the engine's default data-driven path.
+        eval_samples = run.test_view or run.val_view or run.train_view
+        grouped = eval_samples is not None and eval_samples.media_type == "group"
+        if grouped:
+            group_slice = (c.train_config or {}).get("group_slice")
+            eval_samples = flatten_to_slice(eval_samples, group_slice).exists(
+                c.pred_field
+            )
+
         try:
-            kind = fout.resolve_eval_kind(ctx.dataset, c.gt_field)
+            kind = fout.resolve_eval_kind(
+                eval_samples if grouped else ctx.dataset, c.gt_field
+            )
             kwargs = self._build_eval_kwargs(ctx, kind)
-            # The engine runs the eval on the union of the run's populated
-            # splits and welds it (eval_key forward, train_key back)
-            run.evaluate(eval_key=eval_key, **kwargs)
+            # The engine runs the eval on the run's populated splits and welds
+            # it (eval_key forward, train_key back). Grouped runs pass the
+            # flattened slice view; ungrouped pass None (engine's data-driven
+            # view).
+            run.evaluate(
+                samples=eval_samples if grouped else None,
+                eval_key=eval_key,
+                **kwargs,
+            )
         except Exception as e:
             # Boundary: surface eval failures (bad kwargs, missing logits,
             # etc.) as a readable notification instead of an operator crash

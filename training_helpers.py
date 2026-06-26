@@ -20,6 +20,8 @@ from .operators import (
     _resolve_view_arg,
     _split_target_input,
     _view_dropdown,
+    flatten_to_slice,
+    selected_group_slice,
 )
 
 _TITLE = "Train Model"
@@ -118,12 +120,27 @@ def resolve_split_args(ctx):
 
     Saved-view choices pass through as their name (a string) so the engine
     records the breadcrumb; tags and the synthetic targets resolve to views.
+
+    For a grouped dataset, each resolved split is flattened to the chosen image
+    slice (``select_group_slices``) so the engine freezes an ungrouped view —
+    ``apply_model`` can't run on a grouped collection.
     """
+    group_slice = selected_group_slice(ctx)
     return (
-        _resolve_view_arg(ctx, ctx.params["train_target"]),
-        _resolve_view_arg(ctx, ctx.params.get("val_target")),
-        _resolve_view_arg(ctx, ctx.params.get("test_target")),
+        _resolve_split_arg(ctx, ctx.params["train_target"], group_slice),
+        _resolve_split_arg(ctx, ctx.params.get("val_target"), group_slice),
+        _resolve_split_arg(ctx, ctx.params.get("test_target"), group_slice),
     )
+
+
+def _resolve_split_arg(ctx, target, group_slice):
+    """Resolve one split target, flattening to ``group_slice`` when grouped."""
+    arg = _resolve_view_arg(ctx, target)
+    if group_slice is None or arg is None:
+        return arg
+    if isinstance(arg, str):  # a saved-view name breadcrumb; resolve it to flatten
+        arg = ctx.dataset.load_saved_view(arg)
+    return arg.select_group_slices(group_slice)
 
 
 def _output_dir(ctx):
@@ -180,6 +197,12 @@ def record_run(
     recorded on the run (status ``failed`` + full traceback) and summarized in
     the note.
     """
+    # Record which image slice a grouped run trained on (echoed in train_config,
+    # like triggered_by) so the eval flow can reuse it and the panel can show it.
+    group_slice = selected_group_slice(ctx)
+    if group_slice:
+        train_config = {**train_config, "group_slice": group_slice}
+
     run = ctx.dataset.init_training_run(
         train_key,
         train_arg,
@@ -196,6 +219,8 @@ def record_run(
         with run:
             model, checkpoint_uri, apply_kwargs = fit()
             samples = run.test_view or run.val_view or run.train_view
+            grouped = samples is not None and samples.media_type == "group"
+            samples = flatten_to_slice(samples, group_slice)
             apply_kwargs = dict(apply_kwargs or {})
             # macOS uses the 'spawn' start method, which pickles the DataLoader
             # worker payload; FiftyOne's collate/get_item can carry an
@@ -205,6 +230,12 @@ def record_run(
             if sys.platform == "darwin":
                 apply_kwargs.setdefault("num_workers", 0)
             run.apply_model(model, samples=samples, **apply_kwargs)
+            # Grouped datasets: finish()'s auto-eval rebuilds a grouped view
+            # (dataset.select(ids)) that evaluate_* rejects, so run the weld
+            # here on the flattened slice; finish() then skips auto-eval since
+            # eval_key is set. (No-op path for ungrouped datasets.)
+            if grouped and run.config.auto_eval and run.eval_key is None:
+                run.evaluate(samples=samples.exists(run.config.pred_field))
             run.finish(checkpoint_uri=checkpoint_uri)
     except Exception as e:
         _note_failure(run, e)

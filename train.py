@@ -6,8 +6,9 @@ segmentation, pose) -- all tasks are shown, and picking one whose label type the
 dataset lacks surfaces a pointer to the annotation docs -- then the label field
 choices are filtered to the fields whose type + contents support that task
 (segmentation needs a semantic ``Segmentation`` field, a ``Detections`` field
-with instance masks, or a filled ``Polylines`` field; etc.). The framework choices -- Ultralytics YOLO or a HuggingFace
-AutoModel -- are then filtered to those that can train that task + label type
+with instance masks, or a filled ``Polylines`` field; etc.). The framework
+choices -- Ultralytics YOLO, a HuggingFace AutoModel, or a Torchvision model
+-- are then filtered to those that can train that task + label type
 (e.g. pose is YOLO-only, HF segmentation needs semantic masks), so the user
 can't pick an incompatible combination. The trained model is funnelled through
 ``init_training_run`` -> ``apply_model`` -> ``finish`` (in
@@ -23,13 +24,20 @@ import fiftyone.core.labels as fol
 import fiftyone.operators as foo
 import fiftyone.operators.types as types
 
-from . import train_hf, train_yolo
+from . import train_hf, train_torchvision, train_yolo
 from . import training_helpers as th
-from .operators import _dropdown, _valid_identifier, label_fields_for
+from .operators import (
+    _dropdown,
+    _valid_identifier,
+    image_group_slices,
+    label_fields_for,
+    selected_group_slice,
+)
 
 _FRAMEWORK_LABELS = {
     "ultralytics": "Ultralytics YOLO",
     "huggingface": "HuggingFace AutoModel",
+    "torchvision": "Torchvision",
 }
 
 # Tasks offered, in display order. All are always shown; if the dataset lacks
@@ -39,6 +47,14 @@ _TASKS = ("detection", "classification", "segmentation", "pose")
 
 # FiftyOne annotation docs, linked from the "you don't have these labels" guide.
 _DOCS_URL = "https://docs.voxel51.com/user_guide/annotation.html"
+
+# Shown when a grouped dataset has no image slice to train on.
+_NO_IMAGE_SLICE_MSG = (
+    "⚠️ **This grouped dataset has no image slices.**\n\n"
+    "Training applies an image model, so it needs a group slice whose media "
+    "type is `image`. This dataset's slices are all non-image (e.g. point "
+    "clouds), so there's nothing to train on here."
+)
 
 # What each task needs, phrased for that guidance message.
 _TASK_NEEDS = {
@@ -61,18 +77,31 @@ _COUNT_PATHS = {
 }
 
 
+def _source(ctx):
+    """The collection the form inspects for label contents: the chosen image
+    slice for a grouped dataset, else the dataset itself. (Field/task detection
+    reads the schema, which is shared across slices, so it can stay on the
+    dataset; contents counts must reflect the slice that will actually train.)
+    """
+    group_slice = selected_group_slice(ctx)
+    if group_slice is not None:
+        return ctx.dataset.select_group_slices(group_slice)
+    return ctx.dataset
+
+
 def _has_instance_masks(ctx, field):
     """True if any detection in ``field`` carries an instance mask (in-memory
     ``mask`` or on-disk ``mask_path``) -- the prerequisite for segmentation."""
-    n = ctx.dataset.count(f"{field}.detections.mask")
-    n += ctx.dataset.count(f"{field}.detections.mask_path")
+    source = _source(ctx)
+    n = source.count(f"{field}.detections.mask")
+    n += source.count(f"{field}.detections.mask_path")
     return n > 0
 
 
 def _has_filled_polylines(ctx, field):
     """True if any polyline in ``field`` is filled (a polygon/region rather
     than an open curve) -- the prerequisite for segmentation."""
-    return ctx.dataset.count_values(f"{field}.polylines.filled").get(True, 0) > 0
+    return _source(ctx).count_values(f"{field}.polylines.filled").get(True, 0) > 0
 
 
 def _task_label_types(task):
@@ -81,6 +110,7 @@ def _task_label_types(task):
     field types a task accepts)."""
     out = set(train_yolo.TASK_LABEL_TYPES.get(task, ()))
     out.update(train_hf.TASK_LABEL_TYPES.get(task, ()))
+    out.update(train_torchvision.TASK_LABEL_TYPES.get(task, ()))
     return tuple(out)
 
 
@@ -138,6 +168,13 @@ def _valid_frameworks(ctx, task, label_field):
     hf_types = train_hf.TASK_LABEL_TYPES.get(task)
     if train_hf.HAS_TRANSFORMERS and hf_types and issubclass(label_type, hf_types):
         out.append("huggingface")
+    tv_types = train_torchvision.TASK_LABEL_TYPES.get(task)
+    if (
+        train_torchvision.HAS_TORCHVISION
+        and tv_types
+        and issubclass(label_type, tv_types)
+    ):
+        out.append("torchvision")
     return out
 
 
@@ -146,7 +183,7 @@ def _class_notice(ctx, inputs, label_field):
     label_type = th.label_type(ctx, label_field)
     suffix = _COUNT_PATHS.get(label_type)
     if suffix is not None:
-        n = sum(1 for v in ctx.dataset.distinct(f"{label_field}.{suffix}") if v)
+        n = sum(1 for v in _source(ctx).distinct(f"{label_field}.{suffix}") if v)
         label = f"Found {n} classes in '{label_field}'"
     elif label_type is fol.Segmentation:
         targets = (ctx.dataset.mask_targets or {}).get(label_field) or ctx.dataset.default_mask_targets
@@ -181,6 +218,26 @@ class TrainModel(foo.Operator):
         inputs = types.Object()
 
         th.add_train_key(inputs)
+
+        # 0) Grouped dataset: pick the image slice to train on. An image model
+        #    can't be applied to a grouped collection, so everything below
+        #    operates on the chosen slice (see `_source` and `resolve_split_args`).
+        if ctx.dataset.media_type == "group":
+            slices = image_group_slices(ctx)
+            if not slices:
+                inputs.md(_NO_IMAGE_SLICE_MSG, name="no_image_slice")
+                return th.page(inputs)
+            inputs.enum(
+                "group_slice",
+                slices,
+                default=slices[0],
+                required=True,
+                view=_dropdown(slices),
+                label="Group slice",
+                description="This is a grouped dataset — choose the image slice to train on",
+            )
+            if ctx.params.get("group_slice") not in slices:
+                return th.page(inputs)
 
         # 1) Task -- show all; default to one the dataset can actually drive.
         tasks = list(_TASKS)
@@ -255,6 +312,9 @@ class TrainModel(foo.Operator):
         if framework == "huggingface":
             ready = train_hf.hf_model_inputs(inputs, ctx, task)
             pred_default = "hf_predictions"
+        elif framework == "torchvision":
+            ready = train_torchvision.tv_model_inputs(inputs, ctx, task)
+            pred_default = "torchvision_predictions"
         else:
             ready = train_yolo.yolo_model_inputs(inputs, ctx, task)
             pred_default = "yolo_predictions"
@@ -272,10 +332,24 @@ class TrainModel(foo.Operator):
         if not _valid_identifier(ctx, train_key):
             return
 
-        # Guard SDK callers: the App form blocks this, but execute_operator can
-        # be handed a task whose label type isn't on the dataset. Raise (rather
-        # than notify) so the message reaches the SDK caller, before any run is
-        # registered.
+        # Guard SDK callers (the App form blocks both below): execute_operator
+        # can be handed bad params. Raise -- rather than notify -- so the message
+        # reaches the SDK caller, before any run is registered.
+
+        # A grouped dataset must be flattened to one image slice, or apply_model
+        # fails deep in record_run with an opaque SelectGroupSlicesError.
+        if ctx.dataset.media_type == "group":
+            slices = image_group_slices(ctx)
+            if not slices:
+                raise ValueError(
+                    "This grouped dataset has no image slices to train on."
+                )
+            if ctx.params.get("group_slice") not in slices:
+                raise ValueError(
+                    "This is a grouped dataset; pass 'group_slice' as one of "
+                    f"{slices} so training runs on a single image slice."
+                )
+
         task = ctx.params.get("task", "detection")
         if ctx.params.get("label_field") not in _fields_for_task(ctx, task):
             raise ValueError(
@@ -287,7 +361,12 @@ class TrainModel(foo.Operator):
         # runs inside record_run's run block. Guard the whole thing so a
         # StopIteration leaking from the HF Trainer can't poison the async loop.
         framework = ctx.params.get("framework", "ultralytics")
-        core = train_hf.train_hf if framework == "huggingface" else train_yolo.train_yolo
+        if framework == "huggingface":
+            core = train_hf.train_hf
+        elif framework == "torchvision":
+            core = train_torchvision.train_torchvision
+        else:
+            core = train_yolo.train_yolo
         spec = core(ctx, train_key)
         return th.guard_stop_iteration(
             lambda: th.record_run(ctx, train_key, **spec)
